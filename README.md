@@ -23,16 +23,19 @@ into raw + processed JSONL stores. Verified live: 10-post test run and a
 - [Checkpoint / resume behavior](#checkpoint--resume-behavior)
 - [Where raw data is stored](#where-raw-data-is-stored)
 - [Where processed data is stored](#where-processed-data-is-stored)
+- [Comment collection (Phase 2)](#comment-collection-phase-2)
 - [Inspecting the collected data](#inspecting-the-collected-data)
 - [Verifying the collected posts](#verifying-the-collected-posts)
 - [Starting a new collection](#starting-a-new-collection)
 - [Logging](#logging)
 - [Troubleshooting](#troubleshooting)
 - [CLI cheat sheet](#cli-cheat-sheet)
+- [Desktop GUI](#desktop-gui)
 - [Project structure](#project-structure)
 - [Module reference](#module-reference)
 - [Tests](#tests)
 - [Notes on Arctic Shift limits](#notes-on-arctic-shift-limits)
+- [License](#license)
 
 ## Requirements
 
@@ -53,18 +56,28 @@ sudo apt update && sudo apt install -y python3-requests python3-yaml
 ## Setup
 
 ```bash
-cd ~/projects/reddit-collector   # or wherever you cloned it
+git clone <your-repo-url> reddit-collector
+cd reddit-collector
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+pip install -e .   # exposes the short `reddit-collector` command
+cp config.example.yaml config.yaml
 ```
 
-No install step is needed. Run the program in-place with `PYTHONPATH=src`:
+Requires Python >= 3.10. Check dependencies with:
+
+```bash
+python3 -c "import requests, yaml; print('dependencies OK')"
+```
+
+No install is strictly required: without `pip install -e .`, run everything
+in-place with `PYTHONPATH=src` (all examples below use this long form, which
+always works):
 
 ```bash
 PYTHONPATH=src python3 -m reddit_collector validate --config config.example.yaml
 ```
-
-(Optional, needs `pip`: `pip install -r requirements.txt` then
-`pip install -e .` exposes the short `reddit-collector` command registered in
-`pyproject.toml`. All examples below use the long form, which always works.)
 
 ## Configuration
 
@@ -111,6 +124,11 @@ Validation runs before anything else: an invalid file prints
 `Configuration error:` listing every problem and exits 2 without touching
 the API or any data. `${ENV_VAR}` expansion works in any string value, e.g.
 `raw_dir: "${OUTPUT_DIR}/raw"`.
+
+Only `config.yaml` is git-ignored. Name personal research configs clearly
+(e.g. `config.myproject.yaml`) and check `git status` before committing, so
+private research parameters don't end up in the repository — the
+`config.*.example.yaml` files are the shareable templates.
 
 ## CLI commands
 
@@ -266,6 +284,61 @@ chosen because pages append cleanly and readers stream — flat memory usage
 for arbitrarily large datasets. There is no CSV/Parquet export in this
 version.
 
+## Comment collection (Phase 2)
+
+Phase 1 (`collect`) gathers posts and is unchanged. Phase 2 fetches the
+discussion for those posts — one `GET /api/comments/tree?link_id=<post_id>`
+per post (never `/api/comments/search`), returning the complete nested
+thread. Collect posts first, then:
+
+```bash
+# Comments for an existing run (run defaults to the post checkpoint's run)
+PYTHONPATH=src python3 -m reddit_collector collect-comments --config config.philippines-500.yaml
+
+# Explicit run, or a capped test run
+PYTHONPATH=src python3 -m reddit_collector collect-comments --config config.yaml --run 20261005t101821z_philippines
+PYTHONPATH=src python3 -m reddit_collector collect-comments --config config.yaml --max-comment-posts 20
+
+# 5-post smoke test (first 5 posts; resumable into a full run afterwards)
+PYTHONPATH=src python3 -m reddit_collector collect-comments --config config.yaml --smoke
+```
+
+Resuming is just re-running the same command: completed posts (tracked in
+`data/checkpoints/comments-checkpoint.json`, independent of the post
+checkpoint) are never re-requested, and already-stored comments are
+reconciled before starting, so crashes can't duplicate data. `status` also
+reports the comment checkpoint and stored comment counts.
+
+Safety rails: a run with no processed posts (or no usable post IDs) fails
+with a clear error instead of a silent zero-post "success" — while a healthy
+run where every post simply has zero comments still completes successfully.
+Per-run `status` lines show comment progress (`complete` / `in_progress` /
+`not_started`, with posts and comment counts); if the checkpoint is gone but
+`comments.jsonl` data exists, status says so explicitly instead of showing
+nothing.
+
+ID relationships: every comment carries `post_id` (bare post ID = the
+`id` in `posts.jsonl`) and `parent_id` + `parent_kind` (`post` for
+top-level, `comment` for replies), plus `depth` and root-to-node `path`,
+so threads rebuild from `parent_id` alone.
+
+Storage (same run directory, same JSONL format):
+
+- Raw: `data/raw/<run_id>/comments.jsonl` — verbatim `{"kind", "data"}`
+  API nodes in parents-before-children order, including collapsed
+  `"kind": "more"` placeholders (left unresolved in Phase 1).
+- Processed: `data/processed/<run_id>/comments.jsonl` — normalized records:
+  `comment_id, post_id, parent_id, parent_kind, kind, depth, path,
+  subreddit, author, body, score, created_utc, created_iso, permalink,
+  collapsed_children, collapsed_count` (`"more"` nodes are explicitly
+  marked with their unresolved children IDs).
+
+Timing: comments dominate the request budget — one (larger) request per post
+versus ~1 per 100 posts in Phase 1. At ~1 req/s and observed 1–10s per tree,
+10,000 posts take roughly **3–28 hours** depending on thread sizes (posts
+with `num_comments == 0` are skipped by default at zero cost). Tune via
+`comments.tree_limit` / `max_comment_posts` in config.
+
 ## Inspecting the collected data
 
 ```bash
@@ -340,6 +413,8 @@ PYTHONPATH=src python3 -m reddit_collector validate --config <file>          # v
 PYTHONPATH=src python3 -m reddit_collector collect --config <file>           # start
 PYTHONPATH=src python3 -m reddit_collector collect --config <file> --fresh  # discard checkpoint, start over
 PYTHONPATH=src python3 -m reddit_collector resume --config <file>            # continue after interruption
+PYTHONPATH=src python3 -m reddit_collector collect-comments --config <file>   # Phase 2: comments for the run
+PYTHONPATH=src python3 -m reddit_collector collect-comments --config <file> --smoke  # 5-post smoke test
 PYTHONPATH=src python3 -m reddit_collector status --config <file>            # checkpoint + run counts
 PYTHONPATH=src python3 -m reddit_collector <command> --help                  # help for any command
 tail -f logs/collector.log                   # watch progress live
@@ -366,18 +441,23 @@ defaults (shown read-only).
 
 - **Start Collection** writes `data/gui/last-run.yaml`, validates it through
   the normal `load_config`, and collects in a background thread (UI stays
-  responsive). Refuses when a checkpoint exists, like the CLI.
+  responsive): Phase 1 posts first, then Phase 2 comments when the
+  "Collect comments after posts" box is checked. Refuses when a checkpoint
+  exists, like the CLI.
 - **Stop** pauses cleanly after the current finished page — the page is
   stored and checkpointed, so `Resume` continues with zero loss/duplicates.
   (One cooperative `should_stop` hook in `collector._run`; default behavior
   unchanged.)
-- **Resume Collection** continues from the checkpoint; **New Collection
-  (fresh)** confirms, then discards the checkpoint and starts over.
-- Progress shows posts/target, page, retries/waits, errors, elapsed time; a
+- **Resume Collection** continues from the checkpoint (posts and comments
+  resume independently from their own checkpoint files); **New Collection
+  (fresh)** confirms, then discards both the post and comment checkpoints
+  and starts over, so no stale checkpoint can leak into the new run.- Progress shows posts/target, page, retries/waits, errors, elapsed time —
+  plus comment counters once Phase 2 starts; a
   ⏳ banner appears while waiting on rate limits, then collection continues
   automatically. The log panel streams the same log records as the CLI.
 - The completion dialog reports total posts, duration, requests
-  (pages + retries), rate-limit waits, and the output path; **Open Output
+  (pages + retries), rate-limit waits, comment totals when collected, and the
+  output path; **Open Output
   Folder** reveals the run directory (`xdg-open`, path always displayed).
 
 ## Project structure
@@ -400,12 +480,13 @@ reddit-collector/
     checkpoint.py                  # JSON checkpoint store: atomic save, load, clear
     storage.py                     # RunStore: raw + processed JSONL per run, normalize_post
     collector.py                   # collection loop: paginator -> storage -> checkpoints
+    comments.py                    # Phase 2: tree flattening + comment normalization
     gui.py                         # tkinter desktop GUI (form, worker thread, log panel)
-  tests/                           # 132 unittest tests, mocked HTTP (no real calls)
+  tests/                           # 174 unittest tests, mocked HTTP (no real calls)
   data/raw/<run_id>/               # posts.jsonl (verbatim) + manifest.json, one dir per run
   data/processed/<run_id>/         # posts.jsonl (normalized records), one dir per run
   data/e2e-test/                   # isolated 10-post test artifacts
-  data/checkpoints/                # checkpoint.json resume state
+  data/checkpoints/                # checkpoint.json (posts) + comments-checkpoint.json
   logs/
 ```
 
@@ -466,8 +547,9 @@ Stdlib `unittest` with mocked HTTP (no real calls, no real sleeping):
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-121 tests cover client params/errors, spacing/429/`Retry-After`/backoff,
-422-timeout retries, pagination/dedup/resume, checkpoint roundtrip/invalid,
+174 tests cover client params/errors, spacing/429/`Retry-After`/backoff,
+422-timeout retries, comment-tree fetching/flattening, Phase-2 collect/resume,
+pagination/dedup/resume, checkpoint roundtrip/invalid,
 storage normalize/append/corrupt, config validation, CLI exit codes, and
 end-to-end collect/resume with mocked HTTP. Live behavior was additionally
 verified with small real queries (10-post and 500-post runs).
@@ -480,3 +562,9 @@ honour `X-RateLimit-Reset` / `X-RateLimit-Reset-At`, which this tool does
 automatically with conservative spacing plus exponential backoff. Heavy,
 unfiltered queries can also return HTTP 422 timeouts, which are retried the
 same way. For massive backfills, use the monthly `.zst` dumps instead of the API.
+
+## License
+
+No license file is included yet. Add one (e.g. MIT) before publishing if you
+want others to reuse this code — without it, a public repository defaults to
+all rights reserved.

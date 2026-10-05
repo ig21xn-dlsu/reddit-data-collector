@@ -40,7 +40,7 @@ import yaml
 
 from .checkpoint import load_checkpoint_doc
 from .client import ArcticShiftError
-from .collector import collect_new, resume_collection, CollectorError
+from .collector import collect_comments, collect_new, resume_collection, CollectorError
 from .config import DEFAULTS, ConfigError, load_config
 from .logging_setup import setup_logging
 from .storage import StorageError
@@ -98,6 +98,7 @@ def build_config_dict(inputs: Mapping[str, Any]) -> dict[str, Any]:
         "max_posts": max_posts,
         "output": output,
         "collection": dict(DEFAULTS["collection"]),
+        "comments": dict(DEFAULTS["comments"]),
         "logging": {"level": "INFO", "file": _clean_text(inputs.get("log_file")) or "logs/gui.log"},
     }
     return config
@@ -115,6 +116,28 @@ def write_gui_config(inputs: Mapping[str, Any], path: str | Path = GUI_CONFIG_PA
     cfg_path.write_text(yaml.safe_dump(config, sort_keys=True), encoding="utf-8")
     load_config(cfg_path)  # raises ConfigError if anything is invalid
     return cfg_path
+
+
+def run_collection_flow(config: dict[str, Any], *, fresh: bool = False, resume: bool = False,
+                        with_comments: bool = True, should_stop=None) -> dict[str, Any]:
+    """Run Phase 1 (posts) then, optionally, Phase 2 (comments) in one go.
+
+    This is the exact path the GUI worker uses (and is unit-testable without
+    tkinter). Returns {"post": <post summary>, "comments": <summary|None>}.
+    When stopped during Phase 1, Phase 2 is skipped; resume later to continue.
+    """
+    if resume:
+        post_summary = resume_collection(config, should_stop=should_stop)
+    else:
+        post_summary = collect_new(config, fresh=fresh, should_stop=should_stop)
+    comment_summary = None
+    stop_requested = should_stop is not None and should_stop()
+    if with_comments and not post_summary.get("stopped") and not stop_requested:
+        logger.info("Phase 1 complete: starting comment collection for run %s",
+                    post_summary["run_id"])
+        comment_summary = collect_comments(config, run_id=post_summary["run_id"],
+                                           should_stop=should_stop)
+    return {"post": post_summary, "comments": comment_summary}
 
 
 def prefill_inputs(config: Mapping[str, Any]) -> dict[str, Any]:
@@ -170,6 +193,9 @@ class StatsTracker:
         self.errors = 0
         self.last_message = ""
         self.waiting_on_rate_limit = False
+        self.comment_posts_done = 0
+        self.comments_collected = 0
+        self.in_comment_phase = False
 
     def update(self, record: logging.LogRecord) -> None:
         try:
@@ -191,6 +217,22 @@ class StatsTracker:
                 if total:
                     self.posts = int(total.group(1))
             self.waiting_on_rate_limit = False
+        elif name.endswith(".collector"):
+            # Phase-2 per-post line: "Post <id>: N comments (M posts done)"
+            match = re.search(r"Post \S+: (\d+) comments \((\d+) posts done\)", message)
+            if match:
+                self.in_comment_phase = True
+                self.comments_collected += int(match.group(1))
+                self.comment_posts_done = int(match.group(2))
+            self.waiting_on_rate_limit = False
+        elif name.endswith(".checkpoint") and "posts done, " in message:
+            # "Comment checkpoint saved: M posts done, K comments (...)"
+            match = re.search(r"(\d+) posts done, (\d+) comments", message)
+            if match:
+                self.in_comment_phase = True
+                self.comment_posts_done = int(match.group(1))
+                self.comments_collected = int(match.group(2))
+            self.waiting_on_rate_limit = False
         elif "Rate limiting: waiting" in message:
             self.waiting_on_rate_limit = False  # normal spacing, not a limit hit
 
@@ -203,16 +245,20 @@ class StatsTracker:
             "errors": self.errors,
             "waiting_on_rate_limit": self.waiting_on_rate_limit,
             "last_message": self.last_message,
+            "in_comment_phase": self.in_comment_phase,
+            "comment_posts_done": self.comment_posts_done,
+            "comments_collected": self.comments_collected,
         }
 
 
 def format_summary(summary: Mapping[str, Any], duration_secs: float,
-                   stats: Mapping[str, Any], processed_dir: str) -> str:
+                   stats: Mapping[str, Any], processed_dir: str,
+                   comments: Mapping[str, Any] | None = None) -> str:
     """Multiline completion text for the results view."""
     minutes, seconds = divmod(int(duration_secs), 60)
     requests = stats.get("pages", 0) + stats.get("retry_waits", 0)
     stopped_note = " (stopped early — resume to continue)" if summary.get("stopped") else ""
-    return (
+    text = (
         f"Total posts collected: {summary.get('total_posts')} "
         f"({summary.get('posts_this_run')} new this run){stopped_note}\n"
         f"Duration: {minutes}m {seconds:02d}s\n"
@@ -222,6 +268,12 @@ def format_summary(summary: Mapping[str, Any], duration_secs: float,
         f"Errors logged: {stats.get('errors', 0)}\n"
         f"Output: {processed_dir}/{summary.get('run_id')}/posts.jsonl"
     )
+    if comments is not None:
+        text += (
+            f"\nComments: {comments.get('total_comments')} collected "
+            f"({comments.get('posts_completed')} posts)"
+        )
+    return text
 
 
 # -- the tkinter application (only constructed when tkinter exists) --------
@@ -282,6 +334,15 @@ class CollectorApp:
         row("Start date", "after", "2024-01-01", "YYYY-MM-DD / epoch / 1year")
         row("End date", "before", "", "(empty = latest)")
         row("Target posts", "max_posts", "100", "whole number")
+
+        self.collect_comments_var = tk.BooleanVar(value=True) if tk is not None else None
+        comments_row = ttk.Frame(form)
+        comments_row.pack(fill="x", pady=2)
+        if tk is not None:
+            ttk.Checkbutton(comments_row, text="Collect comments after posts (Phase 2)",
+                            variable=self.collect_comments_var).pack(side="left")
+        ttk.Label(comments_row, text="one request per post, same polite rate",
+                  foreground="gray").pack(side="left", padx=(4, 0))
 
         for label, key in (("Raw output dir", "raw_dir"),
                            ("Processed output dir", "processed_dir"),
@@ -461,12 +522,16 @@ class CollectorApp:
 
         def work() -> None:
             try:
-                if resume:
-                    summary = resume_collection(config, should_stop=self.stop_event.is_set)
-                else:
-                    summary = collect_new(config, fresh=fresh,
-                                          should_stop=self.stop_event.is_set)
-                self.result_queue.put({"ok": True, "summary": summary, "config": config})
+                with_comments = bool(self.collect_comments_var.get()) \
+                    if self.collect_comments_var is not None else True
+                if with_comments:
+                    logger.info("Comment collection enabled: Phase 2 will follow Phase 1")
+                result = run_collection_flow(
+                    config, fresh=fresh and not resume, resume=resume,
+                    with_comments=with_comments,
+                    should_stop=self.stop_event.is_set,
+                )
+                self.result_queue.put({"ok": True, "summary": result, "config": config})
             except (CollectorError, ArcticShiftError, StorageError, Exception) as exc:
                 logger.exception("Collection failed: %s", exc)
                 self.result_queue.put({"ok": False, "error": str(exc)})
@@ -496,13 +561,20 @@ class CollectorApp:
             if snap["waiting_on_rate_limit"]:
                 self.status_var.set("⏳ Rate limited — waiting, will continue automatically…")
             elif "Stopping" not in self.status_var.get():
-                self.status_var.set("Collecting…")
+                if snap["in_comment_phase"]:
+                    self.status_var.set("Collecting comments…")
+                else:
+                    self.status_var.set("Collecting…")
             target = f"/{snap['target']}" if snap["target"] else ""
-            self.counters_var.set(
+            counters = (
                 f"Posts: {snap['posts']}{target} | Page: {snap['pages']} | "
                 f"Retries/waits: {snap['retry_waits']} | Errors: {snap['errors']} | "
                 f"Elapsed: {elapsed}s"
             )
+            if snap["in_comment_phase"]:
+                counters += (f" | Comments: {snap['comments_collected']} "
+                             f"({snap['comment_posts_done']} posts)")
+            self.counters_var.set(counters)
             if snap["target"]:
                 self.progress["value"] = min(100.0, 100.0 * snap["posts"] / snap["target"])
         try:
@@ -532,24 +604,30 @@ class CollectorApp:
             self._set_running(False)
             self.refresh_resume_state()
             return
-        summary = result["summary"]
+        summary = result["summary"]["post"]
+        comments = result["summary"]["comments"]
         config = result["config"]
         self.last_run_id = summary["run_id"]
         processed = str(Path(config["output"]["processed_dir"]) / summary["run_id"] / "posts.jsonl")
         self.path_var.set(f"Output: {processed}")
         self.btn_open.configure(state="normal")
-        if summary.get("stopped"):
+        stopped = summary.get("stopped") or (comments is not None and comments.get("stopped"))
+        if stopped:
             self.status_var.set(
                 f"Stopped by user after {summary['total_posts']} posts — resume to continue."
             )
-        else:
+        elif comments is None:
             self.status_var.set(
                 f"Done: {summary['total_posts']} posts collected."
             )
+        else:
+            self.status_var.set(
+                f"Done: {summary['total_posts']} posts, {comments['total_comments']} comments."
+            )
         messagebox.showinfo(
-            "Collection stopped" if summary.get("stopped") else "Collection complete",
+            "Collection stopped" if stopped else "Collection complete",
             format_summary(summary, duration, self.stats.snapshot(),
-                           config["output"]["processed_dir"]),
+                           config["output"]["processed_dir"], comments=comments),
         )
         self._set_running(False)
         self.refresh_resume_state()

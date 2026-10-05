@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import unittest
+import unittest.mock
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock
@@ -112,6 +113,155 @@ class TestStatsTracker(unittest.TestCase):
              "stopped": True},
             5, {"pages": 1, "retry_waits": 0, "errors": 0}, "data/processed")
         self.assertIn("resume", stopped)
+
+    def test_format_summary_with_comments(self):
+        text = format_summary(
+            {"run_id": "r1", "pages": 1, "posts_this_run": 2, "total_posts": 2,
+             "stopped": False},
+            30, {"pages": 1, "retry_waits": 0, "errors": 0}, "data/processed",
+            comments={"run_id": "r1", "posts_completed": 2, "total_comments": 7,
+                      "stopped": False})
+        self.assertIn("7", text)
+        self.assertIn("Comments:", text)
+
+    def test_stats_track_comment_phase(self):
+        stats = StatsTracker()
+        stats.update(_record("reddit_collector.collector", logging.INFO,
+                             "Post %s: %d comments (%d posts done)", ("p1", 3, 1)))
+        stats.update(_record("reddit_collector.checkpoint", logging.INFO,
+                             "Comment checkpoint saved: %d posts done, %d comments (%s)",
+                             (1, 3, "path")))
+        snap = stats.snapshot()
+        self.assertTrue(snap["in_comment_phase"])
+        self.assertEqual(snap["comment_posts_done"], 1)
+        self.assertEqual(snap["comments_collected"], 3)
+
+
+def _gui_post(pid, n_comments=1):
+    return {"id": pid, "created_utc": 1700000000, "subreddit": "python",
+            "title": "t", "author": "u", "score": 1,
+            "num_comments": n_comments, "url": "http://x"}
+
+
+def _gui_tree(*pairs):
+    return {"data": [{"kind": "t1", "data": {
+        "id": cid, "parent_id": f"t3_{pid}", "link_id": f"t3_{pid}", "author": "u",
+        "body": "b", "score": 1, "created_utc": 1700000000,
+        "subreddit": "python", "permalink": "/", "replies": ""}}
+        for cid, pid in pairs]}
+
+
+class TestRunCollectionFlow(unittest.TestCase):
+    def _config(self, tmp):
+        from reddit_collector.config import load_config
+
+        cfg = Path(tmp) / "config.yaml"
+        cfg.write_text(
+            "subreddit: python\nlimit: 10\nmax_posts: 10\noutput:\n"
+            f"  raw_dir: {tmp}/raw\n  processed_dir: {tmp}/processed\n"
+            f"  checkpoint_dir: {tmp}/checkpoints\nlogging:\n  file: {tmp}/run.log\n",
+            encoding="utf-8")
+        return load_config(str(cfg))
+
+    def test_flow_runs_posts_then_comments(self):
+        from reddit_collector.gui import run_collection_flow
+        from reddit_collector.storage import RunStore
+
+        with TemporaryDirectory() as tmp:
+            config = self._config(tmp)
+            post_client = MagicMock()
+            post_client.search_posts.side_effect = [
+                {"data": [_gui_post("p1", 1), _gui_post("p2", 0)]}, {"data": []}]
+            # Drive the flow with injected clients via collector functions.
+            import reddit_collector.gui as gui_module
+            from reddit_collector import collector as collector_module
+
+            real_collect_new = collector_module.collect_new
+            real_collect_comments = collector_module.collect_comments
+
+            def fake_collect_new(cfg, fresh=False, client=None, should_stop=None):
+                return real_collect_new(cfg, fresh=fresh, client=post_client,
+                                        should_stop=should_stop)
+
+            tree_client = MagicMock()
+            tree_client.get_comment_tree.side_effect = [
+                {"data": [{"kind": "t1", "data": {
+                    "id": "c1", "parent_id": "t3_p1", "link_id": "t3_p1",
+                    "author": "u", "body": "b", "score": 1,
+                    "created_utc": 1700000000, "subreddit": "python",
+                    "permalink": "/", "replies": ""}}]}]
+
+            def fake_collect_comments(cfg, run_id=None, max_comment_posts=None,
+                                      skip_empty_posts=None, client=None,
+                                      should_stop=None):
+                return real_collect_comments(cfg, run_id=run_id, client=tree_client,
+                                             should_stop=should_stop)
+
+            with unittest.mock.patch.object(gui_module, "collect_new",
+                                            side_effect=fake_collect_new), \
+                 unittest.mock.patch.object(gui_module, "collect_comments",
+                                            side_effect=fake_collect_comments):
+                result = gui_module.run_collection_flow(config, fresh=True,
+                                                        with_comments=True)
+            self.assertEqual(result["post"]["posts_this_run"], 2)
+            self.assertEqual(result["comments"]["comments_collected"], 1)
+            self.assertEqual(result["comments"]["posts_skipped_empty"], 1)
+            store = RunStore.existing(f"{tmp}/raw", f"{tmp}/processed",
+                                      result["post"]["run_id"])
+            self.assertTrue((store.raw_comments_file).is_file())
+            self.assertTrue((store.processed_comments_file).is_file())
+            self.assertEqual(store.count_processed_comments(), 1)
+
+    def test_flow_without_comments_skips_phase_two(self):
+        from reddit_collector import gui as gui_module
+
+        with TemporaryDirectory() as tmp:
+            config = self._config(tmp)
+            post_client = MagicMock()
+            post_client.search_posts.side_effect = [
+                {"data": [_gui_post("p1", 1)]}, {"data": []}]
+
+            from reddit_collector import collector as collector_module
+            real_collect_new = collector_module.collect_new
+
+            def fake_collect_new(cfg, fresh=False, client=None, should_stop=None):
+                return real_collect_new(cfg, fresh=fresh, client=post_client,
+                                        should_stop=should_stop)
+
+            with unittest.mock.patch.object(gui_module, "collect_new",
+                                            side_effect=fake_collect_new), \
+                 unittest.mock.patch.object(gui_module, "collect_comments") as comments_fn:
+                result = gui_module.run_collection_flow(config, fresh=True,
+                                                        with_comments=False)
+            comments_fn.assert_not_called()
+            self.assertIsNone(result["comments"])
+            self.assertEqual(result["post"]["posts_this_run"], 1)
+
+    def test_flow_stopped_during_posts_skips_comments(self):
+        from reddit_collector import gui as gui_module
+
+        with TemporaryDirectory() as tmp:
+            config = self._config(tmp)
+            post_client = MagicMock()
+            post_client.search_posts.side_effect = [
+                {"data": [_gui_post("p1", 1), _gui_post("p2", 1)]},
+                {"data": [_gui_post("p3", 1)]}]
+
+            from reddit_collector import collector as collector_module
+            real_collect_new = collector_module.collect_new
+
+            def fake_collect_new(cfg, fresh=False, client=None, should_stop=None):
+                return real_collect_new(cfg, fresh=fresh, client=post_client,
+                                        should_stop=should_stop)
+
+            with unittest.mock.patch.object(gui_module, "collect_new",
+                                            side_effect=fake_collect_new), \
+                 unittest.mock.patch.object(gui_module, "collect_comments") as comments_fn:
+                result = gui_module.run_collection_flow(
+                    config, fresh=True, with_comments=True,
+                    should_stop=lambda: True)
+            comments_fn.assert_not_called()
+            self.assertTrue(result["post"]["stopped"])
 
 
 if __name__ == "__main__":

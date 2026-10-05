@@ -142,6 +142,7 @@ class TestCollectResumeStatus(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertIn("Checkpoint: none", out)
             self.assertIn("Stored runs: none", out)
+            self.assertIn("Comment checkpoint: none", out)
 
     def test_status_shows_checkpoint_and_runs(self):
         from reddit_collector.checkpoint import save_checkpoint
@@ -168,6 +169,52 @@ class TestCollectResumeStatus(unittest.TestCase):
     def test_parser_prog_name(self):
         self.assertEqual(build_parser().prog, "reddit-collector")
 
+    def test_collect_comments_success(self):
+        summary = {"run_id": "r1", "posts_attempted": 2, "posts_completed": 2,
+                   "posts_already_complete": 0, "posts_skipped_empty": 0,
+                   "comments_collected": 5, "total_comments": 5, "stopped": False}
+        with TemporaryDirectory() as tmp:
+            with patch("reddit_collector.__main__.collect_comments",
+                       return_value=summary) as collect:
+                code, out, _ = _run(["collect-comments", "--config", _write_config(tmp)])
+            self.assertEqual(code, 0)
+            self.assertIn("5 new comments", out)
+            collect.assert_called_once()
+
+    def test_collect_comments_smoke_caps_at_five(self):
+        with TemporaryDirectory() as tmp:
+            with patch("reddit_collector.__main__.collect_comments",
+                       return_value={"run_id": "r", "posts_attempted": 5,
+                                     "posts_completed": 5, "posts_already_complete": 0,
+                                     "posts_skipped_empty": 0, "comments_collected": 9,
+                                     "total_comments": 9, "stopped": False}) as collect:
+                code, out, _ = _run(["collect-comments", "--config", _write_config(tmp),
+                                     "--smoke"])
+            self.assertEqual(code, 0)
+            self.assertIn("Smoke test", out)
+            self.assertEqual(collect.call_args.kwargs.get("max_comment_posts"), 5)
+
+    def test_collect_comments_missing_run_exits_2(self):
+        with TemporaryDirectory() as tmp:
+            with patch("reddit_collector.__main__.collect_comments",
+                       side_effect=CollectorError("no checkpoint")):
+                code, _, err = _run(["collect-comments", "--config", _write_config(tmp)])
+            self.assertEqual(code, 2)
+
+    def test_collect_comments_help(self):
+        code, out, _ = _run(["collect-comments", "--help"])
+        self.assertEqual(code, 0)
+        self.assertIn("--smoke", out)
+
+    def test_collect_comments_empty_run_exits_2(self):
+        from reddit_collector.storage import RunStore
+
+        with TemporaryDirectory() as tmp:
+            cfg_path = _write_config(tmp)
+            RunStore(f"{tmp}/raw", f"{tmp}/processed", run_id="empty")
+            code, _, err = _run(["collect-comments", "--config", cfg_path, "--run", "empty"])
+            self.assertEqual(code, 2)
+            self.assertIn("no processed posts", err)
     def test_gui_without_tkinter_exits_2_with_hint(self):
         import reddit_collector.gui as gui_module
 

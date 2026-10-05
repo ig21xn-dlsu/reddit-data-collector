@@ -38,6 +38,7 @@ from typing import Any, Iterator, Mapping
 logger = logging.getLogger(__name__)
 
 RAW_FILENAME = "posts.jsonl"
+COMMENTS_FILENAME = "comments.jsonl"
 MANIFEST_FILENAME = "manifest.json"
 
 PROCESSED_FIELDS = (
@@ -153,6 +154,8 @@ class RunStore:
         self.run_id = self._unique_run_id(base)
         self.raw_file = self.raw_root / self.run_id / RAW_FILENAME
         self.processed_file = self.processed_root / self.run_id / RAW_FILENAME
+        self.raw_comments_file = self.raw_root / self.run_id / COMMENTS_FILENAME
+        self.processed_comments_file = self.processed_root / self.run_id / COMMENTS_FILENAME
         self.raw_file.parent.mkdir(parents=True, exist_ok=True)
         self.processed_file.parent.mkdir(parents=True, exist_ok=True)
         logger.info("Run store ready: run_id=%s raw=%s", self.run_id, self.raw_file)
@@ -181,6 +184,8 @@ class RunStore:
         store.run_id = _sanitise_run_part(cleaned)
         store.raw_file = store.raw_root / store.run_id / RAW_FILENAME
         store.processed_file = store.processed_root / store.run_id / RAW_FILENAME
+        store.raw_comments_file = store.raw_root / store.run_id / COMMENTS_FILENAME
+        store.processed_comments_file = store.processed_root / store.run_id / COMMENTS_FILENAME
         if not store.raw_file.parent.is_dir() or not store.processed_file.parent.is_dir():
             raise StorageError(f"No previous run {store.run_id!r} under {raw_root} / {processed_root}")
         logger.info("Run store resumed: run_id=%s", store.run_id)
@@ -214,6 +219,14 @@ class RunStore:
         self.append_processed(posts)
         return raw_count
 
+    def append_raw_comments(self, nodes: list[Mapping[str, Any]]) -> int:
+        """Append verbatim comment tree nodes. Returns the number stored."""
+        return self._append_lines(self.raw_comments_file, nodes)
+
+    def append_processed_comments(self, records: list[Mapping[str, Any]]) -> int:
+        """Append normalized comment records. Returns the number stored."""
+        return self._append_lines(self.processed_comments_file, records)
+
     def write_manifest(self, params: Mapping[str, Any]) -> Path:
         """Record the run parameters next to the raw data."""
         manifest = self.raw_file.parent / MANIFEST_FILENAME
@@ -236,11 +249,23 @@ class RunStore:
     def iter_processed(self) -> Iterator[dict[str, Any]]:
         return self._iter_lines(self.processed_file)
 
+    def iter_raw_comments(self) -> Iterator[dict[str, Any]]:
+        return self._iter_lines(self.raw_comments_file)
+
+    def iter_processed_comments(self) -> Iterator[dict[str, Any]]:
+        return self._iter_lines(self.processed_comments_file)
+
     def count_raw(self) -> int:
         return sum(1 for _ in self.iter_raw())
 
     def count_processed(self) -> int:
         return sum(1 for _ in self.iter_processed())
+
+    def count_raw_comments(self) -> int:
+        return sum(1 for _ in self.iter_raw_comments())
+
+    def count_processed_comments(self) -> int:
+        return sum(1 for _ in self.iter_processed_comments())
 
     # -- internals ----------------------------------------------------
 
@@ -280,6 +305,7 @@ class RunStore:
 
 
 __all__ = [
+    "COMMENTS_FILENAME",
     "MANIFEST_FILENAME",
     "PROCESSED_FIELDS",
     "RAW_FILENAME",

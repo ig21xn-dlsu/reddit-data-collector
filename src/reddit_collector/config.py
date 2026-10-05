@@ -38,6 +38,11 @@ DEFAULTS: dict[str, Any] = {
         "backoff_base_secs": 1.0,
         "backoff_max_secs": 60.0,
     },
+    "comments": {
+        "tree_limit": 9999,
+        "max_comment_posts": None,
+        "skip_empty_posts": True,
+    },
     "logging": {
         "level": "INFO",
         "file": "logs/collector.log",
@@ -191,6 +196,22 @@ def _validate(config: dict[str, Any], cfg_path: Path) -> None:
             val = collection.get(key)
             if not isinstance(val, (int, float)) or isinstance(val, bool) or val <= 0:
                 errors.append(f"'collection.{key}' must be a positive number, got {val!r}")
+
+    comments = config.get("comments")
+    if not isinstance(comments, dict):
+        errors.append("'comments' must be a mapping")
+    else:
+        tree_limit = comments.get("tree_limit")
+        if not isinstance(tree_limit, int) or isinstance(tree_limit, bool) or not 1 <= tree_limit <= 25000:
+            errors.append(f"'comments.tree_limit' must be an integer 1-25000, got {tree_limit!r}")
+        max_cp = comments.get("max_comment_posts")
+        if max_cp is not None and (
+            not isinstance(max_cp, int) or isinstance(max_cp, bool) or max_cp < 1
+        ):
+            errors.append(f"'comments.max_comment_posts' must be a positive integer or null, got {max_cp!r}")
+        skip_empty = comments.get("skip_empty_posts")
+        if not isinstance(skip_empty, bool):
+            errors.append(f"'comments.skip_empty_posts' must be true or false, got {skip_empty!r}")
 
     logging_cfg = config.get("logging")
     if not isinstance(logging_cfg, dict):

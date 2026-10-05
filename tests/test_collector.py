@@ -90,6 +90,44 @@ class TestCollect(unittest.TestCase):
             self.assertNotEqual(first["run_id"], second["run_id"])
             self.assertEqual(second["posts_this_run"], 1)
 
+    def test_fresh_clears_comment_checkpoint_too(self):
+        from reddit_collector.checkpoint import (
+            comment_checkpoint_path,
+            load_comment_checkpoint,
+            save_comment_checkpoint,
+        )
+
+        with TemporaryDirectory() as tmp:
+            config = _write_config(tmp)
+            collect_new(config, client=_client([[ _post("a", 1)]]))
+            save_comment_checkpoint(
+                f"{tmp}/checkpoints",
+                {"completed_post_ids": ["a"], "posts_completed": 1,
+                 "posts_skipped_empty": 0, "comments_collected": 3},
+                "old-run-id",
+            )
+            self.assertTrue(comment_checkpoint_path(f"{tmp}/checkpoints").exists())
+            collect_new(config, fresh=True, client=_client([[ _post("b", 2)]]))
+            self.assertFalse(comment_checkpoint_path(f"{tmp}/checkpoints").exists())
+            self.assertIsNone(load_comment_checkpoint(f"{tmp}/checkpoints"))
+
+    def test_comment_checkpoint_mismatch_still_rejected(self):
+        from reddit_collector.checkpoint import save_comment_checkpoint
+        from reddit_collector.collector import collect_comments
+
+        with TemporaryDirectory() as tmp:
+            config = _write_config(tmp)
+            run = collect_new(config, client=_client([[ _post("a", 1)]]))
+            save_comment_checkpoint(
+                f"{tmp}/checkpoints",
+                {"completed_post_ids": [], "posts_completed": 0,
+                 "posts_skipped_empty": 0, "comments_collected": 0},
+                "some-other-run",
+            )
+            with self.assertRaises(CollectorError) as ctx:
+                collect_comments(config, run_id=run["run_id"], client=_client([]))
+            self.assertIn("some-other-run", str(ctx.exception))
+
     def test_resume_continues_same_run_without_dupes(self):
         with TemporaryDirectory() as tmp:
             config = dict(_write_config(tmp))
@@ -175,6 +213,64 @@ class TestCollect(unittest.TestCase):
             self.assertEqual(len(info["runs"]), 1)
             self.assertEqual(info["runs"][0]["raw_posts"], 1)
             self.assertEqual(info["runs"][0]["processed_posts"], 1)
+            self.assertEqual(info["runs"][0]["comment"]["status"], "not_started")
+
+    def test_status_shows_comment_progress(self):
+        from reddit_collector.collector import collect_comments, describe_comment_status
+
+        def _tree(*nodes):
+            return {"data": list(nodes)}
+
+        def _comment(cid, parent):
+            return {"kind": "t1", "data": {
+                "id": cid, "parent_id": parent, "link_id": "t3_p1", "author": "u",
+                "body": "b", "score": 1, "created_utc": 1700000000,
+                "subreddit": "python", "permalink": "/", "replies": ""}}
+
+        def _seeded_post(pid, ts, n):
+            post = _post(pid, ts)
+            post["num_comments"] = n
+            return post
+
+        with TemporaryDirectory() as tmp:
+            config = _write_config(tmp)
+            run = collect_new(config, client=_client([[ _seeded_post("a", 1, 2),
+                                                        _seeded_post("b", 2, 1)]]))
+            client = MagicMock()
+            client.get_comment_tree.side_effect = [
+                _tree(_comment("c1", "t3_a")), _tree(_comment("c2", "t3_b"))]
+            collect_comments(config, run_id=run["run_id"], client=client)
+            info = describe_status(config)
+            comment = info["runs"][0]["comment"]
+            self.assertEqual(comment["status"], "complete")
+            self.assertEqual(comment["posts_completed"], 2)
+            self.assertEqual(comment["comments_collected"], 2)
+            self.assertEqual(comment["posts_considered"], 2)
+            full = describe_comment_status(config)
+            assert full is not None
+            self.assertEqual(full["run_id"], run["run_id"])
+
+    def test_status_detects_orphaned_comment_data(self):
+        from reddit_collector.collector import collect_comments
+
+        with TemporaryDirectory() as tmp:
+            config = _write_config(tmp)
+            post = _post("a", 1)
+            post["num_comments"] = 3
+            run = collect_new(config, client=_client([[post]]))
+            client = MagicMock()
+            client.get_comment_tree.return_value = {"data": [
+                {"kind": "t1", "data": {
+                    "id": "c1", "parent_id": "t3_a", "link_id": "t3_a", "author": "u",
+                    "body": "b", "score": 1, "created_utc": 1700000000,
+                    "subreddit": "python", "permalink": "/", "replies": ""}}]}
+            collect_comments(config, run_id=run["run_id"], client=client)
+            Path(tmp, "checkpoints", "comments-checkpoint.json").unlink()
+            info = describe_status(config)
+            comment = info["runs"][0]["comment"]
+            self.assertEqual(comment["status"], "unknown")
+            self.assertEqual(comment["comments_collected"], 1)
+            self.assertEqual(comment["posts_completed"], 1)  # distinct post_ids on disk
 
 
 if __name__ == "__main__":

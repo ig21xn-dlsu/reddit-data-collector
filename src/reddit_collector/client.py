@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "https://arctic-shift.photon-reddit.com"
 SEARCH_POSTS_PATH = "/api/posts/search"
+COMMENT_TREE_PATH = "/api/comments/tree"
 
 USER_AGENT = "reddit-collector/0.1.0 (academic research; contact: see README)"
 
@@ -169,6 +170,10 @@ class ArcticShiftClient:
     def search_posts_url(self) -> str:
         return f"{self.base_url}{SEARCH_POSTS_PATH}"
 
+    @property
+    def comment_tree_url(self) -> str:
+        return f"{self.base_url}{COMMENT_TREE_PATH}"
+
     def search_posts(
         self,
         *,
@@ -228,6 +233,54 @@ class ArcticShiftClient:
             if value is not None:
                 params[key] = value
 
+        return self._request_json(SEARCH_POSTS_PATH, params)
+
+    def get_comment_tree(
+        self,
+        *,
+        link_id: str,
+        limit: int = 9999,
+        parent_id: str | None = None,
+        start_breadth: int | None = None,
+        start_depth: int | None = None,
+    ) -> dict[str, Any]:
+        """Fetch the comment tree for one post. Returns the parsed JSON response.
+
+        Uses GET /api/comments/tree (never /api/comments/search): a single
+        request returns the complete nested discussion (top-level comments
+        plus replies) as Reddit-style {"kind", "data"} nodes. Over-limit
+        threads collapse excess into "kind": "more" nodes (left unresolved
+        in Phase 1). Same spacing, retries, and error types as search_posts.
+
+        Raises:
+            ValueError: invalid link_id/limit/parent_id/breadth/depth arguments.
+            ArcticShiftRateLimitError: HTTP 429, persistent after retries.
+            ArcticShiftQueryTimeoutError: transient API timeout, persistent.
+            ArcticShiftAPIError: other non-2xx responses or bad payloads.
+            ArcticShiftNetworkError: connection failures / request timeouts.
+        """
+        post_id = _to_api_value(link_id)
+        if post_id is None:
+            raise ValueError("link_id (post ID) is required and must be non-empty")
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 25000:
+            raise ValueError(f"limit must be an integer 1-25000, got {limit!r}")
+        for name, value in (("start_breadth", start_breadth), ("start_depth", start_depth)):
+            if value is not None and (
+                not isinstance(value, int) or isinstance(value, bool) or value < 0
+            ):
+                raise ValueError(f"{name} must be an integer >= 0, got {value!r}")
+
+        params: dict[str, str] = {"link_id": post_id, "limit": str(limit)}
+        if parent_id is not None and _to_api_value(parent_id) is not None:
+            params["parent_id"] = _to_api_value(parent_id)  # type: ignore[assignment]
+        if start_breadth is not None:
+            params["start_breadth"] = str(start_breadth)
+        if start_depth is not None:
+            params["start_depth"] = str(start_depth)
+        return self._request_json(COMMENT_TREE_PATH, params)
+
+    def _request_json(self, path: str, params: dict[str, str]) -> dict[str, Any]:
+        """GET path with spacing, retries, and error mapping. Shared by all endpoints."""
         limiter = self.rate_limiter
         max_retries = limiter.max_retries if limiter is not None else 0
 
@@ -237,16 +290,16 @@ class ArcticShiftClient:
                 limiter.wait_for_turn()
             try:
                 response = self.session.get(
-                    self.search_posts_url, params=params, timeout=self.timeout_secs
+                    f"{self.base_url}{path}", params=params, timeout=self.timeout_secs
                 )
             except (requests.ConnectionError, requests.Timeout) as exc:
                 if limiter is not None and attempt < max_retries:
                     limiter.wait_before_retry(attempt, reason=f"network error: {exc}")
                     attempt += 1
                     continue
-                raise ArcticShiftNetworkError(f"Network error calling {SEARCH_POSTS_PATH}: {exc}") from exc
+                raise ArcticShiftNetworkError(f"Network error calling {path}: {exc}") from exc
             except requests.RequestException as exc:
-                raise ArcticShiftNetworkError(f"Network error calling {SEARCH_POSTS_PATH}: {exc}") from exc
+                raise ArcticShiftNetworkError(f"Network error calling {path}: {exc}") from exc
 
             if response.status_code == 429:
                 retry_after = parse_retry_after_secs(response.headers)
@@ -288,7 +341,7 @@ class ArcticShiftClient:
                         payload=_safe_body_snippet(response),
                     )
                 raise ArcticShiftAPIError(
-                    f"Arctic Shift API error: HTTP {response.status_code} for {SEARCH_POSTS_PATH}",
+                    f"Arctic Shift API error: HTTP {response.status_code} for {path}",
                     status_code=response.status_code,
                     payload=_safe_body_snippet(response),
                 )
@@ -299,14 +352,14 @@ class ArcticShiftClient:
                     attempt += 1
                     continue
                 raise ArcticShiftAPIError(
-                    f"Arctic Shift API error: HTTP {response.status_code} for {SEARCH_POSTS_PATH}",
+                    f"Arctic Shift API error: HTTP {response.status_code} for {path}",
                     status_code=response.status_code,
                     payload=_safe_body_snippet(response),
                 )
 
             if response.status_code < 200 or response.status_code >= 300:
                 raise ArcticShiftAPIError(
-                    f"Arctic Shift API error: HTTP {response.status_code} for {SEARCH_POSTS_PATH}",
+                    f"Arctic Shift API error: HTTP {response.status_code} for {path}",
                     status_code=response.status_code,
                     payload=_safe_body_snippet(response),
                 )
@@ -357,6 +410,7 @@ def _safe_body_snippet(response: requests.Response, limit: int = 500) -> Any:
 
 # Re-export for convenience so callers import from one place.
 __all__ = [
+    "COMMENT_TREE_PATH",
     "DEFAULT_BASE_URL",
     "SEARCH_POSTS_PATH",
     "ArcticShiftClient",

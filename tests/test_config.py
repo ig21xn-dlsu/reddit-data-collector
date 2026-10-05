@@ -112,6 +112,20 @@ class TestInvalidConfigs(unittest.TestCase):
             MINIMAL + "collection: {throttle_qps: -1}\n", "'collection.throttle_qps'"
         )
 
+    def test_comments_defaults(self):
+        with TemporaryDirectory() as tmp:
+            config = load_config(_write(tmp, MINIMAL))
+            self.assertEqual(config["comments"]["tree_limit"], 9999)
+            self.assertIsNone(config["comments"]["max_comment_posts"])
+            self.assertTrue(config["comments"]["skip_empty_posts"])
+
+    def test_bad_comments_rejected(self):
+        self._assert_rejected(MINIMAL + "comments: {tree_limit: 99999}\n", "'comments.tree_limit'")
+        self._assert_rejected(MINIMAL + "comments: {max_comment_posts: 0}\n",
+                              "'comments.max_comment_posts'")
+        self._assert_rejected(MINIMAL + "comments: {skip_empty_posts: 'yes'}\n",
+                              "'comments.skip_empty_posts'")
+
     def test_bad_output_dir(self):
         self._assert_rejected(
             MINIMAL + "output: {raw_dir: ''}\n", "'output.raw_dir'"

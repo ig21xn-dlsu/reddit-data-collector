@@ -134,6 +134,44 @@ class TestSearchPostsErrors(unittest.TestCase):
             client.search_posts(subreddit="x")
         self.assertEqual(session.get.call_count, 1)
 
+
+class TestGetCommentTree(unittest.TestCase):
+    def test_builds_url_and_params(self):
+        client, session = _client_with(_mock_response(200, {"data": []}))
+        result = client.get_comment_tree(link_id="18vkjb2", limit=9999)
+        self.assertEqual(result, {"data": []})
+        args, kwargs = session.get.call_args
+        self.assertEqual(args[0], DEFAULT_BASE_URL + "/api/comments/tree")
+        self.assertEqual(kwargs["params"], {"link_id": "18vkjb2", "limit": "9999"})
+
+    def test_accepts_prefixed_ids_and_optional_params(self):
+        client, session = _client_with(_mock_response(200, {"data": []}))
+        client.get_comment_tree(link_id="t3_18vkjb2", parent_id="t1_abc",
+                                start_breadth=8, start_depth=8)
+        _, kwargs = session.get.call_args
+        self.assertEqual(kwargs["params"]["link_id"], "t3_18vkjb2")
+        self.assertEqual(kwargs["params"]["parent_id"], "t1_abc")
+        self.assertEqual(kwargs["params"]["start_breadth"], "8")
+        self.assertEqual(kwargs["params"]["start_depth"], "8")
+
+    def test_rejects_bad_arguments(self):
+        client, _ = _client_with(_mock_response(200, {"data": []}))
+        for bad in (None, "", "   "):
+            with self.assertRaises(ValueError):
+                client.get_comment_tree(link_id=bad)
+        for bad in (0, 25001, "100", True):
+            with self.assertRaises(ValueError):
+                client.get_comment_tree(link_id="x", limit=bad)
+        with self.assertRaises(ValueError):
+            client.get_comment_tree(link_id="x", start_depth=-1)
+
+    def test_shares_retry_and_error_handling(self):
+        resp = _mock_response(429, {"error": "slow"}, text="slow",
+                              headers={"X-RateLimit-Reset": "5"})
+        client, _ = _client_with(resp)
+        with self.assertRaises(ArcticShiftRateLimitError):
+            client.get_comment_tree(link_id="x")
+
     def test_http_500_raises_api_error(self):
         client, _ = _client_with(_mock_response(500, None, text="boom"))
         with self.assertRaises(ArcticShiftAPIError) as ctx:

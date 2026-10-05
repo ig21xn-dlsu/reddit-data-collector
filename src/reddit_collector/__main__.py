@@ -22,7 +22,9 @@ from typing import Any, Mapping
 
 from .collector import (
     CollectorError,
+    collect_comments,
     collect_new,
+    describe_comment_status,
     describe_status,
     resume_collection,
 )
@@ -92,6 +94,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     g = sub.add_parser("gui", help="Open the desktop GUI (needs python3-tk).")
     g.add_argument("-c", "--config", default=None, help="Prefill the form from this YAML file.")
+
+    cc = sub.add_parser("collect-comments",
+                        help="Phase 2: fetch comment trees for a previous run's posts.")
+    cc.add_argument("-c", "--config", default="config.yaml", help="YAML config file (default: config.yaml).")
+    cc.add_argument("--run", default=None, help="Run id (default: the post checkpoint's run).")
+    cc.add_argument("--max-comment-posts", type=int, default=None,
+                    help="Cap posts to fetch (default: config comments.max_comment_posts).")
+    cc.add_argument("--smoke", action="store_true",
+                    help="Smoke test: first 5 posts only.")
     return p
 
 
@@ -136,6 +147,31 @@ def cmd_status(args) -> int:
         print(f"Stored runs: {len(runs)}")
         for run in runs:
             print(f"  {run['run_id']}: raw={run['raw_posts']} processed={run['processed_posts']}")
+            comment = run.get("comment")
+            if comment is None:
+                print("    comments: status unavailable")
+            elif comment["status"] == "not_started":
+                print("    comments: not started")
+            elif comment["status"] == "unknown":
+                print(f"    comments: {comment['comments_collected']} stored "
+                      f"(checkpoint missing — progress unknown, rerun collect-comments)")
+            else:
+                print(f"    comments: {comment['status']} — "
+                      f"{comment['posts_completed']}/{comment['posts_considered']} posts, "
+                      f"{comment['comments_collected']} collected")
+    try:
+        comments = describe_comment_status(config)
+    except CollectorError as exc:
+        print(f"Status error: {exc}", file=sys.stderr)
+        return 2
+    if comments is None:
+        print("Comment checkpoint: none")
+    else:
+        print(f"Comment checkpoint: run {comments['run_id']}, "
+              f"{comments['posts_completed']} posts done, "
+              f"{comments['comments_collected']} comments, "
+              f"stored raw={comments['raw_comments']} "
+              f"processed={comments['processed_comments']}")
     return 0
 
 
@@ -175,6 +211,28 @@ def cmd_resume(args) -> int:
     return 0
 
 
+def cmd_collect_comments(args) -> int:
+    config = _load_config_or_exit(args.config)
+    if config is None:
+        return 2
+    _setup_logging_or_exit(args, config)
+    cap = 5 if args.smoke else args.max_comment_posts
+    if args.smoke:
+        print("Smoke test mode: first 5 posts only.")
+    try:
+        summary = collect_comments(config, run_id=args.run, max_comment_posts=cap)
+    except CollectorError as exc:
+        print(f"Comment collection error: {exc}", file=sys.stderr)
+        return 2
+    except (ArcticShiftError, StorageError) as exc:
+        print(f"Comment collection failed: {exc}", file=sys.stderr)
+        return 1
+    print(f"Done: run {summary['run_id']}: "
+          f"{summary['comments_collected']} new comments from "
+          f"{summary['posts_completed']} posts ({summary['total_comments']} total).")
+    return 0
+
+
 def _setup_logging_or_exit(args, config) -> None:
     level = args.log_level.upper() if args.log_level else config["logging"]["level"]
     try:
@@ -201,6 +259,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_collect(args)
     if args.command == "resume":
         return cmd_resume(args)
+    if args.command == "collect-comments":
+        return cmd_collect_comments(args)
     if args.command == "gui":
         return cmd_gui(args)
     raise AssertionError(f"unknown command: {args.command}")  # pragma: no cover
