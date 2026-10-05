@@ -1,0 +1,37 @@
+# Copy this file to config.yaml and edit values.
+# No search parameters are hardcoded in code; everything comes from here
+# (with optional ${ENV_VAR} expansion, see README).
+
+# --- Arctic Shift API (kept configurable, never hardcoded in code) ---
+api:
+  base_url: "https://arctic-shift.photon-reddit.com"
+
+# --- Search parameters (used by the future collector, parsed/validated now) ---
+subreddit: "worldnews"
+title: "wuhan"        # optional keyword filter on post title
+query: null           # optional: searches title + selftext
+selftext: null        # optional keyword filter on post body
+after: "2019-12-30"   # start date: YYYY-MM-DD, epoch, or relative like "1year"
+before: null          # end date, same format as above
+limit: 25             # page size, 1-100 (Arctic Shift max is 100)
+sort: "asc"           # "asc" or "desc", sorted by created_utc
+max_posts: null       # stop after this many posts; null = collect until exhausted
+
+# --- Output locations (relative to project root unless absolute) ---
+output:
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+  checkpoint_dir: "data/checkpoints"
+
+# --- Request behaviour (polite by default: ~1 req/s, retries with backoff) ---
+collection:
+  throttle_qps: 1.0   # max requests/sec; Arctic Shift limits are dynamic, stay conservative
+  max_retries: 5      # retries after the first attempt for 429/5xx/network blips
+  timeout_secs: 30
+  backoff_base_secs: 1.0   # retry delay is base * 2**attempt, capped at backoff_max_secs
+  backoff_max_secs: 60.0   # server-provided Retry-After / X-RateLimit-Reset always wins if larger
+
+# --- Logging ---
+logging:
+  level: "INFO"              # DEBUG, INFO, WARNING, ERROR
+  file: "logs/collector.log"

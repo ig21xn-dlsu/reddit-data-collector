@@ -1,0 +1,38 @@
+# Example research collection: r/Philippines.
+# Copy to config.yaml (or pass explicitly) — no Python changes needed:
+#   cp config.philippines.example.yaml config.yaml
+#   PYTHONPATH=src python -m reddit_collector --config config.yaml --print-config
+
+# --- Arctic Shift API ---
+api:
+  base_url: "https://arctic-shift.photon-reddit.com"
+
+# --- What to collect ---
+subreddit: "Philippines"
+title: null        # keyword filter on post title, e.g. "election"
+query: null        # keyword filter on title + selftext, e.g. "typhoon relief"
+selftext: null     # keyword filter on post body text
+after: "2024-01-01"  # start date: YYYY-MM-DD, epoch, or relative like "1year"
+before: null         # end date, same formats (null = up to the latest posts)
+limit: 100        # posts per API page, 1-100 (Arctic Shift max is 100)
+sort: "asc"       # "asc" (oldest first, recommended) or "desc"
+max_posts: 5000   # stop after this many posts; null = collect until exhausted
+
+# --- Where to put it (relative to project root unless absolute) ---
+output:
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+  checkpoint_dir: "data/checkpoints"
+
+# --- How politely to ask (Arctic Shift rate limits are dynamic; stay conservative) ---
+collection:
+  throttle_qps: 1.0   # max requests per second
+  max_retries: 5      # retries after the first attempt for 429/5xx/network blips
+  timeout_secs: 30
+  backoff_base_secs: 1.0
+  backoff_max_secs: 60.0
+
+# --- Logging ---
+logging:
+  level: "INFO"
+  file: "logs/collector.log"

@@ -1,0 +1,34 @@
+# Research collection: 500 posts from r/Philippines.
+# Reviewed and dry-checked; run with:
+#   PYTHONPATH=src python -m reddit_collector validate --config config.philippines-500.yaml
+#   PYTHONPATH=src python -m reddit_collector collect --config config.philippines-500.yaml
+# If interrupted: PYTHONPATH=src python -m reddit_collector resume --config config.philippines-500.yaml
+
+api:
+  base_url: "https://arctic-shift.photon-reddit.com"
+
+subreddit: "Philippines"
+title: null        # no keyword filter: broad chronological sweep (also avoids slow keyword queries)
+query: null
+selftext: null
+after: "2024-01-01"   # one-month window; r/Philippines posts far more than 500/month,
+before: "2024-02-01"  # so max_posts is the binding stop condition, not the window
+limit: 100        # API-maximum page size: fewest requests (5 pages for 500 posts)
+sort: "asc"       # oldest first; cursor advances via after=max(created_utc)
+max_posts: 500
+
+output:
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+  checkpoint_dir: "data/checkpoints"
+
+collection:
+  throttle_qps: 1.0   # ~1 req/s, well under the documented couple-per-second
+  max_retries: 5
+  timeout_secs: 30
+  backoff_base_secs: 1.0
+  backoff_max_secs: 60.0
+
+logging:
+  level: "INFO"
+  file: "logs/collector.log"

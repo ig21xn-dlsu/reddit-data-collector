@@ -1,0 +1,34 @@
+# Minimal end-to-end test: 10 posts from r/Philippines over a 2-day window.
+# Safe by design: tiny date range, max_posts cap, default polite rate.
+#   PYTHONPATH=src python -m reddit_collector validate --config config.test-philippines.yaml
+#   PYTHONPATH=src python -m reddit_collector collect --config config.test-philippines.yaml
+# Test artifacts stay under data/e2e-test/ + logs/e2e-test.log (repo data/ untouched).
+
+api:
+  base_url: "https://arctic-shift.photon-reddit.com"
+
+subreddit: "Philippines"
+title: null
+query: null
+selftext: null
+after: "2024-01-01"   # small window: 2 days
+before: "2024-01-03"
+limit: 5              # 2 pages x 5 posts exercises the pagination cursor
+sort: "asc"
+max_posts: 10         # hard cap: do not increase for this test
+
+output:
+  raw_dir: "data/e2e-test/raw"
+  processed_dir: "data/e2e-test/processed"
+  checkpoint_dir: "data/e2e-test/checkpoints"
+
+collection:
+  throttle_qps: 1.0
+  max_retries: 5
+  timeout_secs: 30
+  backoff_base_secs: 1.0
+  backoff_max_secs: 60.0
+
+logging:
+  level: "INFO"
+  file: "logs/e2e-test.log"

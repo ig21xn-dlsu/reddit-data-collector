@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.coverage
+htmlcov/
+.ruff_cache/
+
+# Secrets / local environment (never commit)
+.env
+.env.*
+
+# Project outputs - keep dirs, ignore contents
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+data/checkpoints/*
+!data/checkpoints/.gitkeep
+logs/*
+!logs/.gitkeep
+
+# Generated / ad-hoc collection data (never commit)
+# data/e2e-test/ holds test runs (incl. a 24 MB raw file), data/gui/ holds
+# the GUI's auto-written last-run.yaml
+data/e2e-test/
+data/gui/
+
+# Logs anywhere (belt and braces alongside logs/)
+*.log
+
+# Local config (keep examples in git)
+config.yaml
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
