@@ -665,9 +665,3 @@ honour `X-RateLimit-Reset` / `X-RateLimit-Reset-At`, which this tool does
 automatically with conservative spacing plus exponential backoff. Heavy,
 unfiltered queries can also return HTTP 422 timeouts, which are retried the
 same way. For massive backfills, use the monthly `.zst` dumps instead of the API.
-
-## License
-
-No license file is included yet. Add one (e.g. MIT) before publishing if you
-want others to reuse this code — without it, a public repository defaults to
-all rights reserved.
