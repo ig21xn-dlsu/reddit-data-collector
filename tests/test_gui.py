@@ -107,7 +107,7 @@ class TestStatsTracker(unittest.TestCase):
             65, {"pages": 2, "retry_waits": 1, "errors": 0}, "data/processed")
         self.assertIn("10", text)
         self.assertIn("1m 05s", text)
-        self.assertIn("data/processed/r1/posts.jsonl", text)
+        self.assertIn("data/processed/r1/posts/", text)
         stopped = format_summary(
             {"run_id": "r1", "pages": 1, "posts_this_run": 5, "total_posts": 5,
              "stopped": True},
@@ -208,8 +208,8 @@ class TestRunCollectionFlow(unittest.TestCase):
             self.assertEqual(result["comments"]["posts_skipped_empty"], 1)
             store = RunStore.existing(f"{tmp}/raw", f"{tmp}/processed",
                                       result["post"]["run_id"])
-            self.assertTrue((store.raw_comments_file).is_file())
-            self.assertTrue((store.processed_comments_file).is_file())
+            self.assertTrue((store.processed_comments_dir / "comments_00001.jsonl").is_file())
+            self.assertTrue((store.raw_comments_dir / "comments_00001.jsonl").is_file())
             self.assertEqual(store.count_processed_comments(), 1)
 
     def test_flow_without_comments_skips_phase_two(self):

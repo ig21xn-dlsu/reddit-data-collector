@@ -22,6 +22,9 @@ output:
   raw_dir: "data/raw"
   processed_dir: "data/processed"
   checkpoint_dir: "data/checkpoints"
+  chunk_size: 50000   # max JSONL records per chunk file; posts/comments rotate to
+                      # posts_00001.jsonl, posts_00002.jsonl, ... under
+                      # <run_id>/posts/ and <run_id>/comments/ (raw + processed)
 
 # --- Request behaviour (polite by default: ~1 req/s, retries with backoff) ---
 collection:

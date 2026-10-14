@@ -15,6 +15,7 @@ from reddit_collector.collector import (
     resume_collection,
 )
 from reddit_collector.config import load_config
+from reddit_collector.storage import RunStore
 
 
 def _post(pid, ts):
@@ -56,8 +57,9 @@ class TestCollect(unittest.TestCase):
             self.assertEqual(summary["posts_this_run"], 3)
             self.assertEqual(summary["total_posts"], 3)
             run_id = summary["run_id"]
-            raw = list((Path(tmp) / "raw" / run_id / "posts.jsonl").read_text().splitlines())
-            self.assertEqual(len(raw), 3)
+            store = RunStore.existing(f"{tmp}/raw", f"{tmp}/processed", run_id)
+            self.assertEqual(store.count_raw(), 3)
+            self.assertEqual(store.count_processed(), 3)
             store_check = load_checkpoint(f"{tmp}/checkpoints")
             assert store_check is not None
             self.assertEqual(store_check["total_fetched"], 3)

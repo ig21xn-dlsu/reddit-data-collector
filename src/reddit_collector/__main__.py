@@ -62,10 +62,12 @@ def summarize_config(config: Mapping[str, Any]) -> dict[str, Any]:
         "sort": config.get("sort"),
         "max_posts": config.get("max_posts"),
         "throttle_qps": collection.get("throttle_qps") if isinstance(collection, Mapping) else None,
+        "chunk_size": output.get("chunk_size") if isinstance(output, Mapping) else None,
         "output": {
             "raw_dir": output.get("raw_dir"),
             "processed_dir": output.get("processed_dir"),
             "checkpoint_dir": output.get("checkpoint_dir"),
+            "chunk_size": output.get("chunk_size"),
         } if isinstance(output, Mapping) else None,
     }
 
@@ -121,6 +123,36 @@ def cmd_validate(args) -> int:
     print("Configuration OK.")
     for key, value in summarize_config(config).items():
         print(f"  {key}: {value!r}")
+    # Dataset validation across all chunks (collective, not single-file).
+    try:
+        from .storage import RunStore
+        from pathlib import Path as _Path
+        raw_root = _Path(config["output"]["raw_dir"])
+        if raw_root.is_dir():
+            for run_dir in sorted(p for p in raw_root.iterdir() if p.is_dir()):
+                try:
+                    store = RunStore.existing(
+                        config["output"]["raw_dir"], config["output"]["processed_dir"],
+                        run_dir.name,
+                        chunk_size=config["output"].get("chunk_size", 50000)
+                        if config["output"].get("chunk_size") is not None else 50000,
+                    )
+                    report = store.validate_chunks()
+                    totals = report["totals"]
+                    print(f"  run {run_dir.name}: raw_posts={totals['raw_posts']} "
+                          f"processed_posts={totals['processed_posts']} "
+                          f"raw_comments={totals['raw_comments']} "
+                          f"processed_comments={totals['processed_comments']} "
+                          f"chunks_ok={report['ok']}")
+                    if not report["ok"]:
+                        if report["over_limit"]:
+                            print(f"    over-limit chunks: {report['over_limit']}")
+                        if not report["posts_agree"] or not report["comments_agree"]:
+                            print("    WARNING: raw/processed layer counts disagree")
+                except Exception:
+                    continue
+    except Exception:
+        pass
     return 0
 
 

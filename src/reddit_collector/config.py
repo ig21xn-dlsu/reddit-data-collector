@@ -30,6 +30,7 @@ DEFAULTS: dict[str, Any] = {
         "raw_dir": "data/raw",
         "processed_dir": "data/processed",
         "checkpoint_dir": "data/checkpoints",
+        "chunk_size": 50000,
     },
     "collection": {
         "throttle_qps": 1.0,
@@ -178,6 +179,11 @@ def _validate(config: dict[str, Any], cfg_path: Path) -> None:
         for key in ("raw_dir", "processed_dir", "checkpoint_dir"):
             if not isinstance(output.get(key), str) or not output.get(key).strip():
                 errors.append(f"'output.{key}' must be a non-empty string")
+        chunk_size = output.get("chunk_size", 50000)
+        if chunk_size is not None and (
+            not isinstance(chunk_size, int) or isinstance(chunk_size, bool) or chunk_size < 1
+        ):
+            errors.append(f"'output.chunk_size' must be a positive integer, got {chunk_size!r}")
 
     collection = config.get("collection")
     if not isinstance(collection, dict):

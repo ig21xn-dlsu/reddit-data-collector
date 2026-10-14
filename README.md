@@ -113,6 +113,7 @@ Available config files:
 | Request rate | `collection.throttle_qps` | `1.0` = max ~1 request/second |
 | Retries/backoff | `collection.max_retries`, `backoff_base_secs`, `backoff_max_secs` | defaults `5`, `1.0`, `60.0` — normally untouched |
 | Output locations | `output.raw_dir` / `processed_dir` / `checkpoint_dir` | defaults under `data/` — normally untouched |
+| Chunk size | `output.chunk_size` | `50000` = max JSONL records per chunk file (positive int) |
 
 Use one keyword filter at a time unless you want the combination; broad
 keyword searches over busy subreddits can time out server-side (the client
@@ -171,13 +172,14 @@ PYTHONPATH=src python3 -m reddit_collector collect --config config.test-philippi
 # 5. Confirm status (expect checkpoint: 10 posts; Stored runs: 1, raw=10 processed=10)
 PYTHONPATH=src python3 -m reddit_collector status --config config.test-philippines.yaml
 
-# 6. Verify the files (expect 10 and 10)
+# 6. Verify the files (expect 10 and 10; one chunk each by default)
 RUN=$(ls data/e2e-test/raw/)
-wc -l data/e2e-test/raw/$RUN/posts.jsonl data/e2e-test/processed/$RUN/posts.jsonl
+cat data/e2e-test/raw/$RUN/posts/posts_*.jsonl | wc -l
+cat data/e2e-test/processed/$RUN/posts/posts_*.jsonl | wc -l
 
 # 7. Prove resume is idempotent (expect "0 new posts", counts unchanged)
 PYTHONPATH=src python3 -m reddit_collector resume --config config.test-philippines.yaml
-wc -l data/e2e-test/raw/$RUN/posts.jsonl
+cat data/e2e-test/raw/$RUN/posts/posts_*.jsonl | wc -l
 ```
 
 ## Small test dataset
@@ -258,28 +260,54 @@ by `ArcticShiftClient.from_config()`:
   Existing checkpoint: `collect` refuses (use `resume`, or `collect --fresh`
   to deliberately discard). Corrupt checkpoint: clean exit 2, file left
   untouched for inspection.
+- Chunk-safe: on `resume`, `RunStore.existing()` scans the run's chunk files
+  (plus any legacy single file) and continues in the first non-full chunk —
+  never overwriting, duplicating, or skipping. Changing `output.chunk_size`
+  between runs is safe: old chunks are left alone, new records follow the new
+  size.
 - Every save/resume/clear is logged with post count and cursor.
 
 ## Where raw data is stored
 
 `data/raw/<run_id>/` (one timestamped directory per run; runs never overwrite
-each other):
+each other). Posts and comments are chunked at `output.chunk_size`
+(default 50,000 records per file) — a new numbered file starts automatically:
 
-- `posts.jsonl` — every API post object **verbatim** (~80 fields each), one
-  JSON per line. Appended page by page; keep for provenance/reproducibility.
-- `manifest.json` — `run_id`, `started_at`, and the run parameters
-  (subreddit, dates, sort, limits).
+```
+data/raw/<run_id>/
+├── posts/posts_00001.jsonl  (≤ chunk_size verbatim post objects each)
+├── posts/posts_00002.jsonl
+├── comments/comments_00001.jsonl
+└── manifest.json            # run_id, started_at, params, chunk_size,
+                             # chunk file list + record counts, totals
+```
+
+- `posts/posts_*.jsonl` — every API post object **verbatim** (~80 fields each),
+  one JSON per line. Appended page by page (incrementally, never held fully
+  in memory); keep for provenance/reproducibility.
+- `manifest.json` — `run_id`, `started_at`/`updated_at`, `chunk_size`, the run
+  parameters (subreddit, dates, sort, limits), plus `chunks` (file + record
+  counts per stream) and `totals`. Refreshed after every append.
+
+Configure the chunk size in YAML (`output.chunk_size: 50000`). For a 120,000
+record test run you get `posts_00001.jsonl` (50,000), `posts_00002.jsonl`
+(50,000), `posts_00003.jsonl` (20,000) — no chunk exceeds the limit.
+
+Legacy single-file runs (`posts.jsonl` / `comments.jsonl` directly under the
+run dir) are still read (legacy content first, then chunks) but are never
+modified, renamed, or deleted; new records for those runs go to chunks.
 
 ## Where processed data is stored
 
-`data/processed/<run_id>/posts.jsonl` — normalized records, one JSON per
-line, fixed keys:
+`data/processed/<run_id>/posts/posts_*.jsonl` — normalized records, one JSON
+per line, fixed keys (same chunking as raw):
 
 `id, subreddit, title, selftext, author, score, num_comments, created_utc, created_iso, url, permalink`
 
 The original post `id` is preserved verbatim; missing values are null;
-`created_iso` is the UTC ISO-8601 rendering of `created_utc`. **Use this file
-for data analysis** (e.g. `pd.read_json(path, lines=True)`). JSON Lines was
+`created_iso` is the UTC ISO-8601 rendering of `created_utc`. **Use these files
+for data analysis** (e.g. `pd.concat([pd.read_json(f, lines=True) for f in
+sorted(glob("data/processed/<run_id>/posts/posts_*.jsonl"))])`). JSON Lines was
 chosen because pages append cleanly and readers stream — flat memory usage
 for arbitrarily large datasets. There is no CSV/Parquet export in this
 version.
@@ -314,20 +342,20 @@ with a clear error instead of a silent zero-post "success" — while a healthy
 run where every post simply has zero comments still completes successfully.
 Per-run `status` lines show comment progress (`complete` / `in_progress` /
 `not_started`, with posts and comment counts); if the checkpoint is gone but
-`comments.jsonl` data exists, status says so explicitly instead of showing
+comment chunk data exists, status says so explicitly instead of showing
 nothing.
 
 ID relationships: every comment carries `post_id` (bare post ID = the
-`id` in `posts.jsonl`) and `parent_id` + `parent_kind` (`post` for
+`id` in the processed post chunks) and `parent_id` + `parent_kind` (`post` for
 top-level, `comment` for replies), plus `depth` and root-to-node `path`,
 so threads rebuild from `parent_id` alone.
 
-Storage (same run directory, same JSONL format):
+Storage (same run directory, same chunked JSONL format):
 
-- Raw: `data/raw/<run_id>/comments.jsonl` — verbatim `{"kind", "data"}`
+- Raw: `data/raw/<run_id>/comments/comments_*.jsonl` — verbatim `{"kind", "data"}`
   API nodes in parents-before-children order, including collapsed
   `"kind": "more"` placeholders (left unresolved in Phase 1).
-- Processed: `data/processed/<run_id>/comments.jsonl` — normalized records:
+- Processed: `data/processed/<run_id>/comments/comments_*.jsonl` — normalized records:
   `comment_id, post_id, parent_id, parent_kind, kind, depth, path,
   subreddit, author, body, score, created_utc, created_iso, permalink,
   collapsed_children, collapsed_count` (`"more"` nodes are explicitly
@@ -343,20 +371,22 @@ with `num_comments == 0` are skipped by default at zero cost). Tune via
 
 ```bash
 ls data/raw/ data/processed/                             # all runs
-ls data/raw/20261005t101821z_philippines/                # posts.jsonl + manifest.json
-head -n 1 data/processed/20261005t101821z_philippines/posts.jsonl | python3 -m json.tool  # pretty-print one record
-cat data/raw/20261005t101821z_philippines/manifest.json  # run parameters
+ls data/raw/20261005t101821z_philippines/                # posts/ + comments/ + manifest.json
+ls data/raw/20261005t101821z_philippines/posts/          # posts_00001.jsonl, ...
+head -n 1 data/processed/20261005t101821z_philippines/posts/posts_00001.jsonl | python3 -m json.tool  # pretty-print one record
+cat data/raw/20261005t101821z_philippines/manifest.json  # run parameters + chunk inventory
 ```
 
 ## Verifying the collected posts
 
 ```bash
 RUN=20261005t101821z_philippines   # your run ID from the status output
-wc -l data/raw/$RUN/posts.jsonl data/processed/$RUN/posts.jsonl
+cat data/raw/$RUN/posts/posts_*.jsonl | wc -l
+cat data/processed/$RUN/posts/posts_*.jsonl | wc -l
 PYTHONPATH=src python3 -c "
-import json
-raw = [json.loads(l) for l in open('data/raw/$RUN/posts.jsonl')]
-proc = [json.loads(l) for l in open('data/processed/$RUN/posts.jsonl')]
+import glob, json
+raw = [json.loads(l) for f in sorted(glob.glob('data/raw/$RUN/posts/posts_*.jsonl')) for l in open(f)]
+proc = [json.loads(l) for f in sorted(glob.glob('data/processed/$RUN/posts/posts_*.jsonl')) for l in open(f)]
 rids, pids = [r['id'] for r in raw], [r['id'] for r in proc]
 print('raw unique:', len(set(rids)) == len(rids))
 print('processed unique:', len(set(pids)) == len(pids))
@@ -364,6 +394,10 @@ print('layers agree:', set(rids) == set(pids))
 print('subreddits:', {r['subreddit'] for r in proc})
 "
 ```
+
+`validate` also reports collective chunk totals per run (all chunks summed,
+not a single file). For programmatic checks use
+`RunStore.existing(...).validate_chunks()`.
 
 For the 500-post run this reports `500` / `500`, all `True`, `{'Philippines'}`.
 
@@ -419,7 +453,7 @@ PYTHONPATH=src python3 -m reddit_collector status --config <file>            # c
 PYTHONPATH=src python3 -m reddit_collector <command> --help                  # help for any command
 tail -f logs/collector.log                   # watch progress live
 ls data/raw/ data/processed/                 # all runs
-wc -l data/processed/<run_id>/posts.jsonl    # count a run's records
+cat data/processed/<run_id>/posts/posts_*.jsonl | wc -l   # count a run's records
 ```
 
 ## Desktop GUI
@@ -482,9 +516,10 @@ reddit-collector/
     collector.py                   # collection loop: paginator -> storage -> checkpoints
     comments.py                    # Phase 2: tree flattening + comment normalization
     gui.py                         # tkinter desktop GUI (form, worker thread, log panel)
-  tests/                           # 174 unittest tests, mocked HTTP (no real calls)
-  data/raw/<run_id>/               # posts.jsonl (verbatim) + manifest.json, one dir per run
-  data/processed/<run_id>/         # posts.jsonl (normalized records), one dir per run
+  tests/                           # 200 unittest tests, mocked HTTP (no real calls)
+  tests/test_chunking.py           # chunk boundaries, resume, legacy, manifest, 120k acceptance
+  data/raw/<run_id>/               # posts/posts_*.jsonl + comments/comments_*.jsonl + manifest.json
+  data/processed/<run_id>/         # posts/posts_*.jsonl + comments/comments_*.jsonl (chunked)
   data/e2e-test/                   # isolated 10-post test artifacts
   data/checkpoints/                # checkpoint.json (posts) + comments-checkpoint.json
   logs/
@@ -529,11 +564,19 @@ Storage (`storage.py`):
 ```python
 store = RunStore.from_config(load_config("config.yaml"))  # fresh run_id
 store.write_manifest({"subreddit": "python", "sort": "asc"})
-store.append_page(posts)          # one fetched page -> raw + processed
+store.append_page(posts)          # one fetched page -> raw + processed chunks
 resumed = RunStore.existing(raw_dir, processed_dir, run_id)  # resume run
-for record in store.iter_processed():  # streams, never loads all
+for record in store.iter_processed():  # streams across legacy + all chunks
     ...
+store.validate_chunks()           # collective totals + over-limit check
 ```
+
+Chunk size: `output.chunk_size` (default 50000). `RunStore` rotates to
+`posts_00001.jsonl`, `posts_00002.jsonl`, … under `<run_id>/posts/` (and the
+same for `comments/`, raw + processed) and records every file + count in
+`manifest.json`. Resume scans existing chunks and continues in the first
+non-full file; legacy `posts.jsonl`/`comments.jsonl` files are read but never
+written.
 
 Checkpoints (`checkpoint.py`): `save_checkpoint(dir, state, run_id)` after
 each page; `load_checkpoint(dir)` / `load_checkpoint_doc(dir)` on startup;
@@ -547,9 +590,10 @@ Stdlib `unittest` with mocked HTTP (no real calls, no real sleeping):
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-174 tests cover client params/errors, spacing/429/`Retry-After`/backoff,
+200 tests cover client params/errors, spacing/429/`Retry-After`/backoff,
 422-timeout retries, comment-tree fetching/flattening, Phase-2 collect/resume,
-pagination/dedup/resume, checkpoint roundtrip/invalid,
+pagination/dedup/resume, checkpoint roundtrip/invalid, chunked storage
+(boundaries, resume, legacy, manifest, collective validation),
 storage normalize/append/corrupt, config validation, CLI exit codes, and
 end-to-end collect/resume with mocked HTTP. Live behavior was additionally
 verified with small real queries (10-post and 500-post runs).

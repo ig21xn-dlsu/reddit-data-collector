@@ -266,7 +266,8 @@ def format_summary(summary: Mapping[str, Any], duration_secs: float,
         f"{stats.get('retry_waits', 0)} retries)\n"
         f"Rate-limit waits: {stats.get('retry_waits', 0)}\n"
         f"Errors logged: {stats.get('errors', 0)}\n"
-        f"Output: {processed_dir}/{summary.get('run_id')}/posts.jsonl"
+        f"Output: {processed_dir}/{summary.get('run_id')}/posts/ (chunked JSONL, "
+        f"≤ chunk_size per file)"
     )
     if comments is not None:
         text += (
@@ -512,7 +513,7 @@ class CollectorApp:
         self.started_at = time.monotonic()
         self.last_dirs = {k: config["output"][k] for k in ("raw_dir", "processed_dir")}
         self.last_run_id = None
-        self.path_var.set(f"Output: {self.last_dirs['processed_dir']}/<run_id>/posts.jsonl")
+        self.path_var.set(f"Output: {self.last_dirs['processed_dir']}/<run_id>/posts/ (chunked JSONL)")
         mode = "resume" if resume else ("fresh" if fresh else "collect")
         self.status_var.set(f"Collecting ({mode})…")
         self._set_running(True)
@@ -608,7 +609,7 @@ class CollectorApp:
         comments = result["summary"]["comments"]
         config = result["config"]
         self.last_run_id = summary["run_id"]
-        processed = str(Path(config["output"]["processed_dir"]) / summary["run_id"] / "posts.jsonl")
+        processed = str(Path(config["output"]["processed_dir"]) / summary["run_id"] / "posts")
         self.path_var.set(f"Output: {processed}")
         self.btn_open.configure(state="normal")
         stopped = summary.get("stopped") or (comments is not None and comments.get("stopped"))

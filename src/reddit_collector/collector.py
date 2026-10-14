@@ -22,7 +22,7 @@ from .checkpoint import (
 from .client import ArcticShiftClient, ArcticShiftError
 from .comments import CommentError, flatten_comment_tree, normalize_comment
 from .paginator import PostPaginator
-from .storage import RunStore, StorageError
+from .storage import RunStore, StorageError, chunk_size_from_config
 
 logger = logging.getLogger(__name__)
 
@@ -113,12 +113,13 @@ def _run(
             "limit": config.get("limit"),
             "max_posts": config.get("max_posts"),
         })
-        logger.info("Run %s: storing raw data in %s", store.run_id, store.raw_file.parent)
+        logger.info("Run %s: storing raw data in %s", store.run_id, store.raw_run_dir)
     else:
         if not run_id:
             raise CollectorError("Checkpoint has no run_id; cannot resume into the same run.")
         try:
-            store = RunStore.existing(output["raw_dir"], output["processed_dir"], run_id)
+            store = RunStore.existing(output["raw_dir"], output["processed_dir"], run_id,
+                                      chunk_size=chunk_size_from_config(config))
         except StorageError as exc:
             raise CollectorError(str(exc)) from exc
         # Crash-window repair: a page may have been appended without its
@@ -212,7 +213,8 @@ def collect_comments(
             )
         rid = doc["run_id"]
     try:
-        store = RunStore.existing(output["raw_dir"], output["processed_dir"], rid)
+        store = RunStore.existing(output["raw_dir"], output["processed_dir"], rid,
+                                  chunk_size=chunk_size_from_config(config))
     except StorageError as exc:
         raise CollectorError(str(exc)) from exc
 
@@ -353,7 +355,8 @@ def describe_comment_status(config: Mapping[str, Any]) -> dict[str, Any] | None:
     state = doc["comments"]
     counts: dict[str, Any] = {"raw_comments": None, "processed_comments": None}
     try:
-        store = RunStore.existing(output["raw_dir"], output["processed_dir"], doc["run_id"])
+        store = RunStore.existing(output["raw_dir"], output["processed_dir"], doc["run_id"],
+                                  chunk_size=chunk_size_from_config(config))
         counts = {"raw_comments": store.count_raw_comments(),
                   "processed_comments": store.count_processed_comments()}
     except (StorageError, OSError):
@@ -389,7 +392,8 @@ def describe_status(config: Mapping[str, Any]) -> dict[str, Any]:
     if raw_root.is_dir():
         for run_dir in sorted(p for p in raw_root.iterdir() if p.is_dir()):
             try:
-                store = RunStore.existing(output["raw_dir"], output["processed_dir"], run_dir.name)
+                store = RunStore.existing(output["raw_dir"], output["processed_dir"], run_dir.name,
+                                          chunk_size=chunk_size_from_config(config))
                 entry = {
                     "run_id": run_dir.name,
                     "raw_posts": store.count_raw(),

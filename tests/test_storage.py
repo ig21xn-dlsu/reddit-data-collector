@@ -82,10 +82,12 @@ class TestRunStore(unittest.TestCase):
             self.assertEqual(store.append_raw(page1), 2)
             self.assertEqual(store.append_raw(page2), 1)
 
-            lines = (store.raw_file).read_text(encoding="utf-8").splitlines()
-            self.assertEqual(len(lines), 3)
-            self.assertEqual([json.loads(line) for line in lines], page1 + page2)
+            records = list(store.iter_raw())
+            self.assertEqual(records, page1 + page2)
             self.assertEqual(store.count_raw(), 3)
+            # Chunked layout: single chunk for 3 records by default.
+            chunks = store.chunk_inventory()["raw_posts"]
+            self.assertEqual(sum(e["records"] for e in chunks if not e.get("legacy")), 3)
 
     def test_processed_written_per_page(self):
         with TemporaryDirectory() as tmp:
@@ -135,7 +137,9 @@ class TestRunStore(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             store = self._store(tmp, run_id="run1")
             store.append_raw([_raw("a")])
-            with open(store.raw_file, "a", encoding="utf-8") as fh:
+            # Blank lines in any chunk file are skipped on read.
+            chunk = Path(tmp, "raw", "run1", "posts", "posts_00001.jsonl")
+            with open(chunk, "a", encoding="utf-8") as fh:
                 fh.write("\n   \n")
             store.append_raw([_raw("b")])
             self.assertEqual([r["id"] for r in store.iter_raw()], ["a", "b"])
@@ -144,7 +148,8 @@ class TestRunStore(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             store = self._store(tmp, run_id="run1")
             store.append_raw([_raw("a")])
-            with open(store.raw_file, "a", encoding="utf-8") as fh:
+            chunk = Path(tmp, "raw", "run1", "posts", "posts_00001.jsonl")
+            with open(chunk, "a", encoding="utf-8") as fh:
                 fh.write("{broken\n")
             with self.assertRaises(StorageError):
                 list(store.iter_raw())
@@ -164,8 +169,8 @@ class TestRunStore(unittest.TestCase):
             }
             store = RunStore.from_config(config, run_id="run1")
             store.append_page([_raw("a")])
-            self.assertTrue(Path(tmp, "raw", "run1", "posts.jsonl").is_file())
-            self.assertTrue(Path(tmp, "processed", "run1", "posts.jsonl").is_file())
+            self.assertTrue(Path(tmp, "raw", "run1", "posts", "posts_00001.jsonl").is_file())
+            self.assertTrue(Path(tmp, "processed", "run1", "posts", "posts_00001.jsonl").is_file())
 
 
 if __name__ == "__main__":
