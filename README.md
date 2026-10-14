@@ -134,10 +134,12 @@ private research parameters don't end up in the repository — the
 ## CLI commands
 
 ```
-reddit-collector collect --config <file> [--fresh]   # start (refuses if a checkpoint exists)
-reddit-collector resume --config <file>              # continue an interrupted collection
+reddit-collector collect --config <file> [--fresh] [--checkpoint NAME]  # start (refuses if this collection has a checkpoint)
+reddit-collector resume --config <file> [--checkpoint NAME]             # continue this collection
 reddit-collector validate --config <file>            # validate + safe summary, collects nothing
-reddit-collector status --config <file>              # checkpoint + stored-run counts, collects nothing
+reddit-collector status --config <file>              # this collection + all saved checkpoints, collects nothing
+reddit-collector checkpoints --config <file>         # list saved checkpoints, collects nothing
+reddit-collector migrate-checkpoint --config <file>  # copy legacy checkpoint into this collection (originals kept)
 reddit-collector <command> --help                    # help for any command
 ```
 
@@ -246,25 +248,62 @@ by `ArcticShiftClient.from_config()`:
 
 ## Checkpoint / resume behavior
 
-`src/reddit_collector/checkpoint.py` — `data/checkpoints/checkpoint.json`:
+Each collection configuration gets its own persistent checkpoint directory,
+named `<Subreddit>-<after>-<before>` (subreddit `r/`-prefix stripped,
+filename-sanitized), e.g. `Philippines-2026-01-01-2026-06-30`:
 
-- After every page, `save_checkpoint(dir, paginator.state(), run_id=...)`
-  persists cursor, total, seen ids, filters, and run id. Writes are atomic
-  (temp file in the same directory + `os.replace()`), so a crash never
-  leaves a half-written checkpoint; a failed save keeps the previous one.
+```
+data/checkpoints/
+├── Philippines-2026-01-01-2026-06-30/
+│   ├── posts-checkpoint.json
+│   └── comments-checkpoint.json
+└── Thailand-2026-01-01-2026-06-30/
+    ├── posts-checkpoint.json
+    └── comments-checkpoint.json
+```
+
+Switching subreddits never deletes or overwrites another collection's
+checkpoint; resuming restores that collection's progress, run ID, and chunk
+files. Post and comment checkpoints live in the same collection directory and
+are bound to the same run ID, so comment data can never leak into another
+collection's run.
+
+- After every page, `save_checkpoint(dir, paginator.state(), run_id=...,
+  collection=...)` persists cursor, total, seen ids, filters, run id, plus a
+  `collection` block (subreddit, dates, title/query/selftext/author, sort).
+  Writes are atomic (temp file in the same directory + `os.replace()`), so a
+  crash never leaves a half-written checkpoint; a failed save keeps the
+  previous one.
 - `resume` loads the snapshot into `PostPaginator(resume=...)`, which
   re-validates filters and skips seen ids, reopens the same `run_id`, and
   reconciles ids already on disk first — so even a crash between writing a
   page and checkpointing it cannot duplicate that page.
-- Missing checkpoint: `collect` starts fresh, `resume` exits 2 with guidance.
-  Existing checkpoint: `collect` refuses (use `resume`, or `collect --fresh`
-  to deliberately discard). Corrupt checkpoint: clean exit 2, file left
-  untouched for inspection.
+- Compatibility is validated from stored metadata (never just the directory
+  name) **before** any network request or checkpoint/dataset change. A
+  mismatch fails cleanly, e.g.:
+  `Checkpoint mismatch: selected checkpoint 'Thailand-2026-01-01-2026-06-30'
+  belongs to r/Thailand, but the current configuration specifies
+  r/Philippines. Select a compatible checkpoint or change the subreddit.`
+  Nothing is cleared, overwritten, resumed, or fetched on mismatch.
+- Missing checkpoint: `collect` starts fresh, `resume` exits 2 naming the
+  collection and listing available checkpoints. Existing checkpoint:
+  `collect` refuses (use `resume`, or `collect --fresh` to reset **only this
+  collection** — other collections and all datasets on disk are kept).
+  Corrupt checkpoint: clean exit 2, file left untouched for inspection.
+- `--checkpoint NAME` selects a checkpoint explicitly (CLI and GUI dropdown);
+  it must match the configuration or collection fails fast with the mismatch
+  error above.
 - Chunk-safe: on `resume`, `RunStore.existing()` scans the run's chunk files
   (plus any legacy single file) and continues in the first non-full chunk —
   never overwriting, duplicating, or skipping. Changing `output.chunk_size`
   between runs is safe: old chunks are left alone, new records follow the new
   size.
+- Legacy shared checkpoints (`data/checkpoints/checkpoint.json` /
+  `comments-checkpoint.json` at the root) are still listed by `status` /
+  `checkpoints` and left untouched — never adopted silently. Copy one into a
+  collection explicitly after verifying ownership:
+  `reddit-collector migrate-checkpoint --config <file>` (refuses when
+  incompatible or when the target already exists; originals are kept).
 - Every save/resume/clear is logged with post count and cursor.
 
 ## Where raw data is stored
@@ -332,7 +371,7 @@ PYTHONPATH=src python3 -m reddit_collector collect-comments --config config.yaml
 ```
 
 Resuming is just re-running the same command: completed posts (tracked in
-`data/checkpoints/comments-checkpoint.json`, independent of the post
+the collection's `comments-checkpoint.json`, independent of the post
 checkpoint) are never re-requested, and already-stored comments are
 reconciled before starting, so crashes can't duplicate data. `status` also
 reports the comment checkpoint and stored comment counts.
@@ -403,10 +442,10 @@ For the 500-post run this reports `500` / `500`, all `True`, `{'Philippines'}`.
 
 ## Starting a new collection
 
-A leftover checkpoint makes plain `collect` refuse — that is the safety net
-against accidentally continuing an old run. To start over, discard it
-explicitly (old data files are never touched; the new run gets a fresh
-`run_id`):
+A leftover checkpoint for the same collection makes plain `collect` refuse —
+that is the safety net against accidentally continuing an old run. To start
+over, reset only that collection explicitly (other collections and old data
+files are never touched; the new run gets a fresh `run_id`):
 
 ```bash
 PYTHONPATH=src python3 -m reddit_collector collect --config config.myresearch.yaml --fresh
@@ -430,8 +469,8 @@ waits — everything needed to audit what the program did.
 
 | Symptom | Cause / fix |
 |---|---|
-| `collect` refuses: "checkpoint already exists" | A previous run left state. `resume` to continue it, or `collect --fresh` to discard and restart. |
-| `resume`: "nothing to resume" (exit 2) | No checkpoint in this config's `checkpoint_dir` — use `collect`, or check you're pointing at the right config. |
+| `collect` refuses: "checkpoint already exists" | That collection left state. `resume` (or `resume --checkpoint NAME`) to continue it, or `collect --fresh` to reset only that collection. |
+| `resume`: "nothing to resume" (exit 2) | No checkpoint for this collection in `checkpoint_dir` — use `collect`, pick another `--checkpoint`, or `checkpoints` to list. |
 | `Configuration error:` (exit 2) | Fix the listed fields; nothing was fetched. Quote odd YAML values; dates accept `YYYY-MM-DD`, epochs, or `"1year"`. |
 | `Collection failed: … 429 …` (exit 1) | Rate limit persisted through all retries. Wait a few minutes, lower `throttle_qps`, then `resume` — progress is checkpointed. |
 | `Collection failed: … timed out …` (exit 1) | Query too heavy. Narrow the date window, add a subreddit/keyword filter, or lower `limit`, then `resume` or `--fresh`. |
@@ -445,8 +484,11 @@ waits — everything needed to audit what the program did.
 cd ~/projects/reddit-collector
 PYTHONPATH=src python3 -m reddit_collector validate --config <file>          # validate only
 PYTHONPATH=src python3 -m reddit_collector collect --config <file>           # start
-PYTHONPATH=src python3 -m reddit_collector collect --config <file> --fresh  # discard checkpoint, start over
-PYTHONPATH=src python3 -m reddit_collector resume --config <file>            # continue after interruption
+PYTHONPATH=src python3 -m reddit_collector collect --config <file> --fresh  # reset only this collection, start over
+PYTHONPATH=src python3 -m reddit_collector resume --config <file>            # continue this collection
+PYTHONPATH=src python3 -m reddit_collector resume --config <file> --checkpoint <name>  # resume an explicit checkpoint
+PYTHONPATH=src python3 -m reddit_collector checkpoints --config <file>      # list saved checkpoints
+PYTHONPATH=src python3 -m reddit_collector migrate-checkpoint --config <file>  # adopt legacy checkpoint (originals kept)
 PYTHONPATH=src python3 -m reddit_collector collect-comments --config <file>   # Phase 2: comments for the run
 PYTHONPATH=src python3 -m reddit_collector collect-comments --config <file> --smoke  # 5-post smoke test
 PYTHONPATH=src python3 -m reddit_collector status --config <file>            # checkpoint + run counts
@@ -476,16 +518,25 @@ defaults (shown read-only).
 - **Start Collection** writes `data/gui/last-run.yaml`, validates it through
   the normal `load_config`, and collects in a background thread (UI stays
   responsive): Phase 1 posts first, then Phase 2 comments when the
-  "Collect comments after posts" box is checked. Refuses when a checkpoint
-  exists, like the CLI.
+  "Collect comments after posts" box is checked. Refuses when this
+  collection's checkpoint exists, like the CLI.
+- **Saved checkpoints** dropdown lists every saved collection automatically
+  (name, status, post count, saved time), with Refresh. Selecting one shows
+  it clearly and fills subreddit/start/end dates from its stored metadata;
+  Resume uses the selection, and a mismatched selection (e.g. Thailand
+  checkpoint with a Philippines form) is blocked with a clear error before
+  anything is fetched or written. "No checkpoints available" is shown when
+  empty. The list refreshes after every run, stop, or reset.
 - **Stop** pauses cleanly after the current finished page — the page is
   stored and checkpointed, so `Resume` continues with zero loss/duplicates.
   (One cooperative `should_stop` hook in `collector._run`; default behavior
   unchanged.)
-- **Resume Collection** continues from the checkpoint (posts and comments
-  resume independently from their own checkpoint files); **New Collection
-  (fresh)** confirms, then discards both the post and comment checkpoints
-  and starts over, so no stale checkpoint can leak into the new run.- Progress shows posts/target, page, retries/waits, errors, elapsed time —
+- **Resume Collection** continues the selected (or form-matching) checkpoint
+  (posts and comments resume independently from their own checkpoint files);
+  **New Collection (fresh)** confirms naming the exact collection to reset,
+  then clears only that collection's post and comment checkpoints and starts
+  over — other collections and all datasets on disk are kept, so no stale
+  checkpoint can leak into the new run.- Progress shows posts/target, page, retries/waits, errors, elapsed time —
   plus comment counters once Phase 2 starts; a
   ⏳ banner appears while waiting on rate limits, then collection continues
   automatically. The log panel streams the same log records as the CLI.
@@ -516,12 +567,13 @@ reddit-collector/
     collector.py                   # collection loop: paginator -> storage -> checkpoints
     comments.py                    # Phase 2: tree flattening + comment normalization
     gui.py                         # tkinter desktop GUI (form, worker thread, log panel)
-  tests/                           # 200 unittest tests, mocked HTTP (no real calls)
+  tests/                           # 229 unittest tests, mocked HTTP (no real calls)
   tests/test_chunking.py           # chunk boundaries, resume, legacy, manifest, 120k acceptance
+  tests/test_named_checkpoints.py  # per-collection checkpoints, mismatch validation, GUI listing, migration
   data/raw/<run_id>/               # posts/posts_*.jsonl + comments/comments_*.jsonl + manifest.json
   data/processed/<run_id>/         # posts/posts_*.jsonl + comments/comments_*.jsonl (chunked)
   data/e2e-test/                   # isolated 10-post test artifacts
-  data/checkpoints/                # checkpoint.json (posts) + comments-checkpoint.json
+  data/checkpoints/<Sub>-<after>-<before>/  # posts-checkpoint.json + comments-checkpoint.json per collection
   logs/
 ```
 
@@ -578,9 +630,14 @@ same for `comments/`, raw + processed) and records every file + count in
 non-full file; legacy `posts.jsonl`/`comments.jsonl` files are read but never
 written.
 
-Checkpoints (`checkpoint.py`): `save_checkpoint(dir, state, run_id)` after
-each page; `load_checkpoint(dir)` / `load_checkpoint_doc(dir)` on startup;
-`clear_checkpoint(dir)` for `--fresh`.
+Checkpoints (`checkpoint.py`): per-collection dirs
+`checkpoint_dir_for_config(root, config)` holding `posts-checkpoint.json` +
+`comments-checkpoint.json` with a `collection` metadata block;
+`save_checkpoint(dir, state, run_id, collection)` after each page;
+`load_checkpoint(dir)` / `load_checkpoint_doc(dir)` on startup;
+`clear_checkpoint(dir)` resets one collection; `list_collections(root)` for
+discovery; `validate_collection_compatible(doc, config)` before any resume;
+`migrate_legacy_checkpoint(root, config)` for explicit legacy adoption.
 
 ## Tests
 
@@ -590,9 +647,11 @@ Stdlib `unittest` with mocked HTTP (no real calls, no real sleeping):
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-200 tests cover client params/errors, spacing/429/`Retry-After`/backoff,
+229 tests cover client params/errors, spacing/429/`Retry-After`/backoff,
 422-timeout retries, comment-tree fetching/flattening, Phase-2 collect/resume,
-pagination/dedup/resume, checkpoint roundtrip/invalid, chunked storage
+pagination/dedup/resume, per-collection checkpoints (naming, switching,
+resume, mismatch validation, GUI listing, legacy migration),
+checkpoint roundtrip/invalid, chunked storage
 (boundaries, resume, legacy, manifest, collective validation),
 storage normalize/append/corrupt, config validation, CLI exit codes, and
 end-to-end collect/resume with mocked HTTP. Live behavior was additionally

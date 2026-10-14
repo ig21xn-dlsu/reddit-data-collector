@@ -119,10 +119,18 @@ class TestCollectResumeStatus(unittest.TestCase):
             self.assertIn("Collection failed", err)
 
     def test_collect_corrupt_checkpoint_exits_2_cleanly(self):
+        from reddit_collector.checkpoint import (
+            POSTS_CHECKPOINT_FILENAME,
+            checkpoint_dir_for_config,
+        )
+        from reddit_collector.config import load_config
+
         with TemporaryDirectory() as tmp:
             cfg_path = _write_config(tmp)
-            Path(f"{tmp}/checkpoints").mkdir(parents=True, exist_ok=True)
-            Path(f"{tmp}/checkpoints/checkpoint.json").write_text("{broken", encoding="utf-8")
+            config = load_config(cfg_path)
+            cp_dir = checkpoint_dir_for_config(f"{tmp}/checkpoints", config)
+            cp_dir.mkdir(parents=True, exist_ok=True)
+            (cp_dir / POSTS_CHECKPOINT_FILENAME).write_text("{broken", encoding="utf-8")
             code, _, err = _run(["collect", "--config", cfg_path])
             self.assertEqual(code, 2)
             self.assertIn("--fresh", err)
@@ -145,11 +153,13 @@ class TestCollectResumeStatus(unittest.TestCase):
             self.assertIn("Comment checkpoint: none", out)
 
     def test_status_shows_checkpoint_and_runs(self):
-        from reddit_collector.checkpoint import save_checkpoint
+        from reddit_collector.checkpoint import checkpoint_dir_for_config, save_checkpoint
+        from reddit_collector.config import load_config
         from reddit_collector.storage import RunStore
 
         with TemporaryDirectory() as tmp:
             cfg_path = _write_config(tmp)
+            config = load_config(cfg_path)
             store = RunStore(f"{tmp}/raw", f"{tmp}/processed", run_id="run1")
             store.append_raw([{"id": "a"}])
             from reddit_collector.paginator import PostPaginator
@@ -159,7 +169,8 @@ class TestCollectResumeStatus(unittest.TestCase):
             client.search_posts.return_value = {"data": [{"id": "a", "created_utc": 1}]}
             paginator = PostPaginator(client, subreddit="python", page_size=2)
             list(paginator.iter_pages())
-            save_checkpoint(f"{tmp}/checkpoints", paginator.state(), run_id="run1")
+            save_checkpoint(checkpoint_dir_for_config(f"{tmp}/checkpoints", config),
+                            paginator.state(), run_id="run1")
 
             code, out, _ = _run(["status", "--config", cfg_path])
             self.assertEqual(code, 0)

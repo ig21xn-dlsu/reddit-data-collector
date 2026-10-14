@@ -7,7 +7,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock
 
-from reddit_collector.checkpoint import load_checkpoint
+from reddit_collector.checkpoint import checkpoint_dir_for_config, load_checkpoint
 from reddit_collector.collector import (
     CollectorError,
     collect_new,
@@ -60,7 +60,8 @@ class TestCollect(unittest.TestCase):
             store = RunStore.existing(f"{tmp}/raw", f"{tmp}/processed", run_id)
             self.assertEqual(store.count_raw(), 3)
             self.assertEqual(store.count_processed(), 3)
-            store_check = load_checkpoint(f"{tmp}/checkpoints")
+            cp_dir = checkpoint_dir_for_config(f"{tmp}/checkpoints", config)
+            store_check = load_checkpoint(cp_dir)
             assert store_check is not None
             self.assertEqual(store_check["total_fetched"], 3)
             self.assertTrue((Path(tmp) / "raw" / run_id / "manifest.json").is_file())
@@ -74,12 +75,13 @@ class TestCollect(unittest.TestCase):
             self.assertIn("resume", str(ctx.exception))
 
     def test_collect_with_corrupt_checkpoint_raises_collector_error(self):
-        from reddit_collector.checkpoint import CHECKPOINT_FILENAME
+        from reddit_collector.checkpoint import POSTS_CHECKPOINT_FILENAME
 
         with TemporaryDirectory() as tmp:
             config = _write_config(tmp)
-            Path(f"{tmp}/checkpoints").mkdir(parents=True, exist_ok=True)
-            Path(f"{tmp}/checkpoints/{CHECKPOINT_FILENAME}").write_text("{broken", encoding="utf-8")
+            cp_dir = checkpoint_dir_for_config(f"{tmp}/checkpoints", config)
+            cp_dir.mkdir(parents=True, exist_ok=True)
+            (cp_dir / POSTS_CHECKPOINT_FILENAME).write_text("{broken", encoding="utf-8")
             with self.assertRaises(CollectorError) as ctx:
                 collect_new(config, client=_client([]))
             self.assertIn("--fresh", str(ctx.exception))
@@ -101,17 +103,18 @@ class TestCollect(unittest.TestCase):
 
         with TemporaryDirectory() as tmp:
             config = _write_config(tmp)
+            cp_dir = str(checkpoint_dir_for_config(f"{tmp}/checkpoints", config))
             collect_new(config, client=_client([[ _post("a", 1)]]))
             save_comment_checkpoint(
-                f"{tmp}/checkpoints",
+                cp_dir,
                 {"completed_post_ids": ["a"], "posts_completed": 1,
                  "posts_skipped_empty": 0, "comments_collected": 3},
                 "old-run-id",
             )
-            self.assertTrue(comment_checkpoint_path(f"{tmp}/checkpoints").exists())
+            self.assertTrue(comment_checkpoint_path(cp_dir).exists())
             collect_new(config, fresh=True, client=_client([[ _post("b", 2)]]))
-            self.assertFalse(comment_checkpoint_path(f"{tmp}/checkpoints").exists())
-            self.assertIsNone(load_comment_checkpoint(f"{tmp}/checkpoints"))
+            self.assertFalse(comment_checkpoint_path(cp_dir).exists())
+            self.assertIsNone(load_comment_checkpoint(cp_dir))
 
     def test_comment_checkpoint_mismatch_still_rejected(self):
         from reddit_collector.checkpoint import save_comment_checkpoint
@@ -120,8 +123,9 @@ class TestCollect(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             config = _write_config(tmp)
             run = collect_new(config, client=_client([[ _post("a", 1)]]))
+            cp_dir = str(checkpoint_dir_for_config(f"{tmp}/checkpoints", config))
             save_comment_checkpoint(
-                f"{tmp}/checkpoints",
+                cp_dir,
                 {"completed_post_ids": [], "posts_completed": 0,
                  "posts_skipped_empty": 0, "comments_collected": 0},
                 "some-other-run",
@@ -267,7 +271,8 @@ class TestCollect(unittest.TestCase):
                     "body": "b", "score": 1, "created_utc": 1700000000,
                     "subreddit": "python", "permalink": "/", "replies": ""}}]}
             collect_comments(config, run_id=run["run_id"], client=client)
-            Path(tmp, "checkpoints", "comments-checkpoint.json").unlink()
+            cp_dir = checkpoint_dir_for_config(f"{tmp}/checkpoints", config)
+            (cp_dir / "comments-checkpoint.json").unlink()
             info = describe_status(config)
             comment = info["runs"][0]["comment"]
             self.assertEqual(comment["status"], "unknown")

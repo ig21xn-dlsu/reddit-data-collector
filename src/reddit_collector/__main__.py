@@ -26,6 +26,7 @@ from .collector import (
     collect_new,
     describe_comment_status,
     describe_status,
+    list_available_checkpoints,
     resume_collection,
 )
 from .config import ConfigError, load_config
@@ -80,13 +81,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--log-level", default=None, help="Override logging.level (e.g. DEBUG, INFO).")
     sub = p.add_subparsers(dest="command", required=True, metavar="<command>")
 
-    c = sub.add_parser("collect", help="Start a new collection (refuses if a checkpoint exists).")
+    c = sub.add_parser("collect", help="Start a new collection (refuses if this collection has a checkpoint).")
     c.add_argument("-c", "--config", default="config.yaml", help="YAML config file (default: config.yaml).")
     c.add_argument("--fresh", action="store_true",
-                   help="Discard any saved checkpoint and start over.")
+                   help="Reset only the matching collection checkpoint and start over.")
+    c.add_argument("--checkpoint", default=None,
+                   help="Explicit checkpoint name (<Subreddit>-<after>-<before>); must match the config.")
 
-    r = sub.add_parser("resume", help="Continue an interrupted collection from its checkpoint.")
+    r = sub.add_parser("resume", help="Continue this collection from its checkpoint.")
     r.add_argument("-c", "--config", default="config.yaml", help="YAML config file (default: config.yaml).")
+    r.add_argument("--checkpoint", default=None,
+                   help="Explicit checkpoint name to resume; must match the config.")
 
     v = sub.add_parser("validate", help="Validate the config and show a safe summary (collects nothing).")
     v.add_argument("-c", "--config", default="config.yaml", help="YAML config file (default: config.yaml).")
@@ -101,10 +106,19 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Phase 2: fetch comment trees for a previous run's posts.")
     cc.add_argument("-c", "--config", default="config.yaml", help="YAML config file (default: config.yaml).")
     cc.add_argument("--run", default=None, help="Run id (default: the post checkpoint's run).")
+    cc.add_argument("--checkpoint", default=None,
+                    help="Explicit checkpoint name; must match the config.")
     cc.add_argument("--max-comment-posts", type=int, default=None,
                     help="Cap posts to fetch (default: config comments.max_comment_posts).")
     cc.add_argument("--smoke", action="store_true",
                     help="Smoke test: first 5 posts only.")
+
+    lc = sub.add_parser("checkpoints", help="List saved per-collection checkpoints (collects nothing).")
+    lc.add_argument("-c", "--config", default="config.yaml", help="YAML config file (default: config.yaml).")
+
+    mc = sub.add_parser("migrate-checkpoint",
+                        help="Copy the legacy shared checkpoint into this config's collection (originals kept).")
+    mc.add_argument("-c", "--config", default="config.yaml", help="YAML config file (default: config.yaml).")
     return p
 
 
@@ -166,12 +180,22 @@ def cmd_status(args) -> int:
         print(f"Status error: {exc}", file=sys.stderr)
         return 2
     checkpoint = info["checkpoint"]
+    print(f"Collection: {info.get('collection')}")
     if checkpoint is None:
-        print("Checkpoint: none (no interrupted collection)")
+        print("Checkpoint: none (no saved progress for this collection)")
     else:
-        print(f"Checkpoint: run {checkpoint['run_id']}, "
+        print(f"Checkpoint: {info['collection']}, run {checkpoint['run_id']}, "
               f"{checkpoint['total_fetched']} posts, cursor={checkpoint['cursor']!r}, "
               f"saved {checkpoint['saved_at']}")
+    checkpoints = info.get("checkpoints") or []
+    if checkpoints:
+        print(f"Saved checkpoints: {len(checkpoints)}")
+        for entry in checkpoints:
+            print(f"  {format_checkpoint_entry(entry)}")
+    else:
+        print("Saved checkpoints: none")
+    if info.get("legacy_note"):
+        print(f"Note: {info['legacy_note']}")
     runs = info["runs"]
     if not runs:
         print("Stored runs: none")
@@ -207,13 +231,72 @@ def cmd_status(args) -> int:
     return 0
 
 
+def format_checkpoint_entry(entry: Mapping[str, Any]) -> str:
+    """One-line summary for a discovered checkpoint (never raises)."""
+    try:
+        name = entry.get("name", "?")
+        if entry.get("error"):
+            return f"{name}: error — {entry['error']}"
+        posts = entry.get("posts") or {}
+        comments = entry.get("comments") or {}
+        if entry.get("legacy"):
+            prefix = "legacy (shared checkpoint, migrate explicitly)"
+        else:
+            prefix = str(name)
+        if not entry.get("has_posts") and not entry.get("has_comments"):
+            return f"{prefix}: empty"
+        status = posts.get("status", "unknown") if isinstance(posts, Mapping) else "unknown"
+        total = posts.get("total_fetched", "?") if isinstance(posts, Mapping) else "?"
+        saved = entry.get("saved_at") or "unknown time"
+        run = entry.get("run_id") or "no run"
+        detail = f"{prefix}: {status}, {total} posts, run {run}, saved {saved}"
+        if entry.get("has_comments") and isinstance(comments, Mapping):
+            detail += f"; comments: {comments.get('comments_collected', '?')} collected"
+        return detail
+    except Exception as exc:  # never break status listing
+        return f"{entry.get('name', '?')}: status unavailable ({exc})"
+
+
+def cmd_checkpoints(args) -> int:
+    config = _load_config_or_exit(args.config)
+    if config is None:
+        return 2
+    try:
+        entries = list_available_checkpoints(config)
+    except CollectorError as exc:
+        print(f"Status error: {exc}", file=sys.stderr)
+        return 2
+    if not entries:
+        print("Saved checkpoints: none")
+    else:
+        print(f"Saved checkpoints: {len(entries)}")
+        for entry in entries:
+            print(f"  {format_checkpoint_entry(entry)}")
+    return 0
+
+
+def cmd_migrate_checkpoint(args) -> int:
+    config = _load_config_or_exit(args.config)
+    if config is None:
+        return 2
+    from .checkpoint import CheckpointError, migrate_legacy_checkpoint
+
+    try:
+        target = migrate_legacy_checkpoint(config["output"]["checkpoint_dir"], config)
+    except CheckpointError as exc:
+        print(f"Migration error: {exc}", file=sys.stderr)
+        return 2
+    print(f"Migrated legacy checkpoint to {target} (originals kept).")
+    return 0
+
+
 def cmd_collect(args) -> int:
     config = _load_config_or_exit(args.config)
     if config is None:
         return 2
     _setup_logging_or_exit(args, config)
     try:
-        summary = collect_new(config, fresh=args.fresh)
+        summary = collect_new(config, fresh=args.fresh, checkpoint=args.checkpoint)
     except CollectorError as exc:
         print(f"Collection error: {exc}", file=sys.stderr)
         return 2
@@ -231,7 +314,7 @@ def cmd_resume(args) -> int:
         return 2
     _setup_logging_or_exit(args, config)
     try:
-        summary = resume_collection(config)
+        summary = resume_collection(config, checkpoint=args.checkpoint)
     except CollectorError as exc:
         print(f"Resume error: {exc}", file=sys.stderr)
         return 2
@@ -252,7 +335,8 @@ def cmd_collect_comments(args) -> int:
     if args.smoke:
         print("Smoke test mode: first 5 posts only.")
     try:
-        summary = collect_comments(config, run_id=args.run, max_comment_posts=cap)
+        summary = collect_comments(config, run_id=args.run, max_comment_posts=cap,
+                                   checkpoint=args.checkpoint)
     except CollectorError as exc:
         print(f"Comment collection error: {exc}", file=sys.stderr)
         return 2
@@ -293,6 +377,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_resume(args)
     if args.command == "collect-comments":
         return cmd_collect_comments(args)
+    if args.command == "checkpoints":
+        return cmd_checkpoints(args)
+    if args.command == "migrate-checkpoint":
+        return cmd_migrate_checkpoint(args)
     if args.command == "gui":
         return cmd_gui(args)
     raise AssertionError(f"unknown command: {args.command}")  # pragma: no cover

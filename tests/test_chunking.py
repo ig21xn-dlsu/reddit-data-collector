@@ -273,6 +273,38 @@ class TestResumeAndFresh(unittest.TestCase):
                                       first["run_id"], chunk_size=2)
             self.assertEqual([r["id"] for r in fresh.iter_processed()], ["a", "b", "c", "d"])
 
+    def test_resume_warns_when_chunk_deleted(self):
+        with TemporaryDirectory() as tmp:
+            config = _write_config(tmp, chunk_size=2)
+            first = collect_new(
+                config, client=self._client([[self._post("a", 1), self._post("b", 2)],
+                                             [self._post("c", 3), self._post("d", 4)]]))
+            chunk2 = (Path(tmp) / "processed" / first["run_id"] / "posts"
+                      / "posts_00002.jsonl")
+            self.assertTrue(chunk2.is_file())
+            chunk2.unlink()  # external deletion: checkpoint still claims 4
+            with self.assertLogs("reddit_collector.collector", level="WARNING") as logs:
+                second = resume_collection(config, client=self._client([[]]))
+            self.assertTrue(any("fewer than checkpointed" in line for line in logs.output),
+                            "\n".join(logs.output))
+            self.assertEqual(second["run_id"], first["run_id"])
+            # Missing records are not silently re-fetched (ids checkpointed),
+            # so the on-disk total stays short and visible.
+            final = RunStore.existing(f"{tmp}/raw", f"{tmp}/processed",
+                                      first["run_id"], chunk_size=2)
+            self.assertEqual(final.count_processed(), 2)
+
+    def test_resume_no_warning_when_intact(self):
+        with TemporaryDirectory() as tmp:
+            config = _write_config(tmp, chunk_size=2)
+            first = collect_new(
+                config, client=self._client([[self._post("a", 1), self._post("b", 2)]]))
+            with self.assertNoLogs("reddit_collector.collector", level="WARNING"):
+                resume_collection(config, client=self._client([[self._post("c", 3)], []]))
+            final = RunStore.existing(f"{tmp}/raw", f"{tmp}/processed",
+                                      first["run_id"], chunk_size=2)
+            self.assertEqual([r["id"] for r in final.iter_processed()], ["a", "b", "c"])
+
     def test_fresh_collection_new_run_keeps_old_chunks(self):
         with TemporaryDirectory() as tmp:
             config = _write_config(tmp, chunk_size=2)

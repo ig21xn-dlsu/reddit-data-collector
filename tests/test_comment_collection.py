@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 
 from reddit_collector.checkpoint import (
     CheckpointError,
+    checkpoint_dir_for_config,
     load_comment_checkpoint,
     save_comment_checkpoint,
 )
@@ -106,7 +107,8 @@ class TestCollectComments(unittest.TestCase):
             self.assertEqual(store.count_processed_comments(), 3)
             self.assertEqual([r["comment_id"] for r in store.iter_processed_comments()],
                              ["c1", "c2", "c3"])
-            loaded = load_comment_checkpoint(f"{tmp}/checkpoints")
+            loaded = load_comment_checkpoint(
+                checkpoint_dir_for_config(f"{tmp}/checkpoints", config))
             assert loaded is not None
             self.assertEqual(sorted(loaded["comments"]["completed_post_ids"]),
                              ["p1", "p2", "p3"])
@@ -321,7 +323,8 @@ class TestCommentRateLimitHandling(unittest.TestCase):
                 collect_comments(config, run_id="run1", client=client)
             self.assertEqual(session.get.call_count, 2)  # initial + 1 retry
             # Failed post NOT marked complete; no partial comments stored.
-            doc = load_comment_checkpoint(f"{tmp}/checkpoints")
+            doc = load_comment_checkpoint(
+                checkpoint_dir_for_config(f"{tmp}/checkpoints", config))
             self.assertTrue(doc is None or doc["comments"]["completed_post_ids"] == [])
             resumed = RunStore.existing(f"{tmp}/raw", f"{tmp}/processed", "run1")
             self.assertEqual(list(resumed.iter_processed_comments()), [])
@@ -386,7 +389,8 @@ class TestDuplicateProtection(unittest.TestCase):
             collect_comments(config, run_id="run1", client=_client(trees))
             # Lose the checkpoint but keep the files: reconcile must suppress
             # all refetches purely from stored post ids.
-            Path(tmp, "checkpoints", "comments-checkpoint.json").unlink()
+            (checkpoint_dir_for_config(f"{tmp}/checkpoints", config)
+             / "comments-checkpoint.json").unlink()
             client2 = _client([_tree(_t1("xx", "t3_pa"))])
             collect_comments(config, run_id="run1", client=client2)
             self.assertEqual(client2.get_comment_tree.call_count, 0)

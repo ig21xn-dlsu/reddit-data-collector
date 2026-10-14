@@ -38,7 +38,12 @@ except ImportError:  # pragma: no cover - environment without python3-tk
 
 import yaml
 
-from .checkpoint import load_checkpoint_doc
+from .checkpoint import (
+    CheckpointError,
+    list_collections,
+    load_checkpoint_doc,
+    validate_collection_compatible,
+)
 from .client import ArcticShiftError
 from .collector import collect_comments, collect_new, resume_collection, CollectorError
 from .config import DEFAULTS, ConfigError, load_config
@@ -119,24 +124,28 @@ def write_gui_config(inputs: Mapping[str, Any], path: str | Path = GUI_CONFIG_PA
 
 
 def run_collection_flow(config: dict[str, Any], *, fresh: bool = False, resume: bool = False,
-                        with_comments: bool = True, should_stop=None) -> dict[str, Any]:
+                        with_comments: bool = True, should_stop=None,
+                        checkpoint: str | None = None) -> dict[str, Any]:
     """Run Phase 1 (posts) then, optionally, Phase 2 (comments) in one go.
 
     This is the exact path the GUI worker uses (and is unit-testable without
     tkinter). Returns {"post": <post summary>, "comments": <summary|None>}.
     When stopped during Phase 1, Phase 2 is skipped; resume later to continue.
+    ``checkpoint`` selects an explicit named checkpoint (must match the config).
     """
     if resume:
-        post_summary = resume_collection(config, should_stop=should_stop)
+        post_summary = resume_collection(config, should_stop=should_stop, checkpoint=checkpoint)
     else:
-        post_summary = collect_new(config, fresh=fresh, should_stop=should_stop)
+        post_summary = collect_new(config, fresh=fresh, should_stop=should_stop,
+                                   checkpoint=checkpoint)
     comment_summary = None
     stop_requested = should_stop is not None and should_stop()
     if with_comments and not post_summary.get("stopped") and not stop_requested:
         logger.info("Phase 1 complete: starting comment collection for run %s",
                     post_summary["run_id"])
         comment_summary = collect_comments(config, run_id=post_summary["run_id"],
-                                           should_stop=should_stop)
+                                           should_stop=should_stop,
+                                           checkpoint=checkpoint)
     return {"post": post_summary, "comments": comment_summary}
 
 
@@ -157,6 +166,121 @@ def prefill_inputs(config: Mapping[str, Any]) -> dict[str, Any]:
         "processed_dir": get(output, "processed_dir") or "",
         "checkpoint_dir": get(output, "checkpoint_dir") or "",
         "log_file": get(logging_cfg, "file") or "",
+    }
+
+
+# -- checkpoint dropdown helpers (importable and testable without tkinter) --
+
+def list_checkpoint_options(checkpoint_root: str | Path) -> list[dict[str, Any]]:
+    """Summarize saved checkpoints for the GUI dropdown (never raises)."""
+    try:
+        entries = list_collections(checkpoint_root)
+    except Exception as exc:
+        logger.warning("Could not list checkpoints in %s: %s", checkpoint_root, exc)
+        return []
+    options: list[dict[str, Any]] = []
+    for entry in entries:
+        options.append({
+            "name": entry.get("name", "?"),
+            "label": format_checkpoint_option(entry),
+            "status": _option_status(entry),
+            "saved_at": entry.get("saved_at"),
+            "run_id": entry.get("run_id"),
+            "subreddit": ((entry.get("posts") or {}).get("subreddit")
+                          if isinstance(entry.get("posts"), Mapping) else None),
+            "legacy": bool(entry.get("legacy")),
+            "has_error": bool(entry.get("error") or entry.get("comments_error")),
+        })
+    return options
+
+
+def _option_status(entry: Mapping[str, Any]) -> str:
+    if entry.get("error"):
+        return "error"
+    posts = entry.get("posts")
+    if isinstance(posts, Mapping) and posts.get("present"):
+        return str(posts.get("status", "in_progress"))
+    if entry.get("has_comments"):
+        return "comments_only"
+    return "empty"
+
+
+def format_checkpoint_option(entry: Mapping[str, Any]) -> str:
+    """Human-readable dropdown label: subreddit + date range + status + time."""
+    name = str(entry.get("name", "?"))
+    if entry.get("error"):
+        return f"{name} (error — see log)"
+    if entry.get("legacy"):
+        posts = entry.get("posts") or {}
+        total = posts.get("total_fetched", "?") if isinstance(posts, Mapping) else "?"
+        return f"legacy — shared checkpoint ({total} posts; migrate explicitly)"
+    posts = entry.get("posts") if isinstance(entry.get("posts"), Mapping) else None
+    status = posts.get("status", "unknown") if posts else "comments_only"
+    total = posts.get("total_fetched", "?") if posts else "?"
+    saved = entry.get("saved_at") or "unknown time"
+    label = f"{name} ({status}, {total} posts, saved {saved})"
+    if entry.get("has_comments"):
+        comments = entry.get("comments") if isinstance(entry.get("comments"), Mapping) else None
+        if comments and comments.get("present"):
+            label += f" [+{comments.get('comments_collected', '?')} comments]"
+    return label
+
+
+def describe_selection_mismatch(form_config: Mapping[str, Any], selected_name: str | None,
+                                checkpoint_root: str | Path) -> str | None:
+    """Validate an explicitly selected checkpoint against the form config.
+
+    Returns an error string (shown in the GUI, logged) or None when compatible.
+    Performs no network requests and writes nothing.
+    """
+    if not selected_name:
+        return None
+    from .checkpoint import checkpoint_dir_for_name
+
+    try:
+        target = checkpoint_dir_for_name(checkpoint_root, selected_name)
+        doc = load_checkpoint_doc(target)
+    except (CheckpointError, OSError) as exc:
+        return f"Checkpoint error: {exc}"
+    if doc is None:
+        return (f"No checkpoint {selected_name!r} found. "
+                f"Select an available checkpoint or start a new collection.")
+    try:
+        validate_collection_compatible(doc, form_config, selected_name=selected_name)
+    except CheckpointError as exc:
+        logger.warning("Checkpoint selection rejected: %s", exc)
+        return str(exc)
+    return None
+
+
+def checkpoint_form_values(checkpoint_root: str | Path, name: str) -> dict[str, str] | None:
+    """Subreddit/date values from a checkpoint's stored metadata (for populate).
+
+    Returns None when the checkpoint is missing or unreadable.
+    """
+    from .checkpoint import checkpoint_dir_for_name
+
+    try:
+        doc = load_checkpoint_doc(checkpoint_dir_for_name(checkpoint_root, name))
+    except (CheckpointError, OSError):
+        return None
+    if doc is None:
+        return None
+    collection = doc.get("collection") if isinstance(doc.get("collection"), dict) else None
+    paginator = doc.get("paginator") if isinstance(doc.get("paginator"), dict) else {}
+    filters = paginator.get("filters", {}) if isinstance(paginator, Mapping) else {}
+    if collection:
+        sub = str(collection.get("subreddit", ""))
+        after = collection.get("after")
+        before = collection.get("before")
+    else:
+        sub = str(filters.get("subreddit", "") or "")
+        after = filters.get("after")
+        before = filters.get("before")
+    return {
+        "subreddit": sub,
+        "after": "" if after is None else str(after),
+        "before": "" if before is None else str(before),
     }
 
 
@@ -302,11 +426,13 @@ class CollectorApp:
         self.last_run_id: str | None = None
         self.last_dirs: dict[str, str] = {}
         self._handler_attached = False
+        self.checkpoint_options: list[dict[str, Any]] = []
+        self.selected_checkpoint: str | None = None
 
         self._build_form(prefill or {})
         self._build_progress()
         self._build_log_panel()
-        self.refresh_resume_state()
+        self.refresh_checkpoint_list()
         self.root.after(self.POLL_MS, self._pump)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -356,7 +482,7 @@ class CollectorApp:
                                                   "processed_dir": "data/processed",
                                                   "checkpoint_dir": "data/checkpoints"}[key])))
             entry.pack(side="left", fill="x", expand=True)
-            entry.bind("<KeyRelease>", lambda _e: self.refresh_resume_state())
+            entry.bind("<KeyRelease>", lambda _e: self.refresh_checkpoint_list())
             browse = ttk.Button(frame, text="Browse…",
                                 command=lambda e=entry: self._browse_dir(e))
             browse.pack(side="left", padx=(4, 0))
@@ -364,6 +490,22 @@ class CollectorApp:
 
         ttk.Label(form, text="Rate: ≤1 req/s polite throttle, retries with backoff (automatic).",
                   foreground="gray").pack(anchor="w", pady=(4, 0))
+
+        checkpoint_box = ttk.LabelFrame(self.root, text="Saved checkpoints", padding=8)
+        checkpoint_box.pack(fill="x", padx=8, pady=4)
+        picker_row = ttk.Frame(checkpoint_box)
+        picker_row.pack(fill="x", pady=2)
+        ttk.Label(picker_row, text="Checkpoint", width=22).pack(side="left")
+        self.checkpoint_var = tk.StringVar(value="")
+        self.checkpoint_combo = ttk.Combobox(picker_row, textvariable=self.checkpoint_var,
+                                             state="readonly", width=60)
+        self.checkpoint_combo.pack(side="left", fill="x", expand=True)
+        self.checkpoint_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_checkpoint_selected())
+        ttk.Button(picker_row, text="Refresh",
+                   command=self.refresh_checkpoint_list).pack(side="left", padx=(4, 0))
+        self.checkpoint_status_var = tk.StringVar(value="No checkpoint selected.")
+        ttk.Label(checkpoint_box, textvariable=self.checkpoint_status_var,
+                  foreground="gray").pack(anchor="w")
 
         buttons = ttk.Frame(self.root)
         buttons.pack(fill="x", padx=8, pady=4)
@@ -413,7 +555,7 @@ class CollectorApp:
         if chosen:
             entry.delete(0, tk.END)
             entry.insert(0, chosen)
-            self.refresh_resume_state()
+            self.refresh_checkpoint_list()
 
     def _prepare_config(self) -> dict[str, Any] | None:
         """Assemble, write, and validate the GUI config. None + dialog on error."""
@@ -424,17 +566,133 @@ class CollectorApp:
             messagebox.showerror("Invalid configuration", str(exc))
             return None
 
-    def refresh_resume_state(self) -> None:
-        """Enable Resume only when a checkpoint exists for the current dirs."""
+    def _checkpoint_root(self) -> str:
+        try:
+            return self.entries["checkpoint_dir"].get().strip() or "data/checkpoints"
+        except Exception:
+            return "data/checkpoints"
+
+    def _selected_checkpoint_name(self) -> str | None:
+        """Map the dropdown display value back to the checkpoint name."""
+        if tk is None or not hasattr(self, "checkpoint_var"):
+            return None
+        value = self.checkpoint_var.get().strip()
+        if not value:
+            return None
+        for option in self.checkpoint_options:
+            if option["label"] == value:
+                return option["name"]
+        return None  # stale display value: fall back to the form's collection
+
+    def _form_config_silent(self) -> dict[str, Any] | None:
+        """Build a config dict from the form without file IO or dialogs."""
+        try:
+            return build_config_dict(self._form_inputs())
+        except (ValueError, Exception):
+            return None
+
+    def refresh_checkpoint_list(self) -> None:
+        """Discover saved checkpoints and repopulate the dropdown."""
         if tk is None:
             return
+        root = self._checkpoint_root()
+        self.checkpoint_options = list_checkpoint_options(root)
+        labels = [o["label"] for o in self.checkpoint_options]
+        if hasattr(self, "checkpoint_combo"):
+            # Prefer the form's own collection when it exists; otherwise keep
+            # the previous selection; otherwise select nothing (the user picks).
+            preferred: str | None = None
+            form_config = self._form_config_silent()
+            if form_config is not None:
+                try:
+                    from .checkpoint import collection_name_for_config
+
+                    candidate = collection_name_for_config(form_config)
+                    if any(o["name"] == candidate for o in self.checkpoint_options):
+                        preferred = candidate
+                except (CheckpointError, Exception):
+                    preferred = None
+            previous = self._selected_checkpoint_name()
+            if preferred is not None:
+                wanted = preferred
+            elif previous and any(o["name"] == previous for o in self.checkpoint_options):
+                wanted = previous
+            else:
+                wanted = None
+            self.checkpoint_combo.configure(values=labels)
+            if wanted is not None:
+                match = next(o for o in self.checkpoint_options if o["name"] == wanted)
+                self.checkpoint_var.set(match["label"])
+                self.selected_checkpoint = wanted
+            else:
+                self.checkpoint_var.set("")
+                self.selected_checkpoint = None
+        if hasattr(self, "checkpoint_status_var"):
+            if not self.checkpoint_options:
+                self.checkpoint_status_var.set(
+                    "No checkpoints available — start a collection to create one.")
+            elif self.selected_checkpoint:
+                self.checkpoint_status_var.set(
+                    f"Selected checkpoint: {self.selected_checkpoint}")
+            else:
+                self.checkpoint_status_var.set(
+                    "No checkpoint selected — pick one to resume, or start fresh.")
+        self.refresh_resume_state()
+
+    def _on_checkpoint_selected(self) -> None:
+        """A dropdown choice populates subreddit/dates and revalidates."""
+        name = self._selected_checkpoint_name()
+        self.selected_checkpoint = name
+        if hasattr(self, "checkpoint_status_var"):
+            self.checkpoint_status_var.set(
+                f"Selected checkpoint: {name}" if name else "No checkpoint selected.")
+        if name and not str(name).lower().startswith("legacy"):
+            values = checkpoint_form_values(self._checkpoint_root(), name)
+            if values:
+                for key in ("subreddit", "after", "before"):
+                    entry = self.entries.get(key)
+                    if entry is not None and values.get(key) not in (None, ""):
+                        try:
+                            entry.delete(0, tk.END)
+                            entry.insert(0, values[key])
+                        except Exception:
+                            pass
+        self.refresh_resume_state()
+
+    def refresh_resume_state(self) -> None:
+        """Enable Resume when the selection or the form matches a checkpoint."""
+        if tk is None:
+            return
+        has_checkpoint = False
         try:
-            checkpoint_dir = self.entries["checkpoint_dir"].get().strip() or "data/checkpoints"
-            has_checkpoint = load_checkpoint_doc(checkpoint_dir) is not None
+            root = self._checkpoint_root()
+            selected = self._selected_checkpoint_name()
+            if selected:
+                from .checkpoint import checkpoint_dir_for_name
+
+                target = checkpoint_dir_for_name(root, selected)
+                has_checkpoint = (target / "posts-checkpoint.json").exists() or \
+                    (target / "checkpoint.json").exists() or \
+                    (target / "comments-checkpoint.json").exists()
+            else:
+                form_config = self._form_config_silent()
+                if form_config is not None:
+                    from .checkpoint import checkpoint_dir_for_config
+
+                    target = checkpoint_dir_for_config(root, form_config)
+                    has_checkpoint = (target / "posts-checkpoint.json").exists() or \
+                        (target / "checkpoint.json").exists() or \
+                        (target / "comments-checkpoint.json").exists()
         except Exception:
             has_checkpoint = False
         if hasattr(self, "btn_resume"):
             self.btn_resume.configure(state="normal" if has_checkpoint else "disabled")
+
+    def _selection_error(self, config: dict[str, Any]) -> str | None:
+        selected = self._selected_checkpoint_name()
+        if not selected:
+            return None
+        return describe_selection_mismatch(config, selected, self._checkpoint_root())
 
     def start_collection(self, fresh: bool = False) -> None:
         if self.worker is not None and self.worker.is_alive():
@@ -442,42 +700,72 @@ class CollectorApp:
         config = self._prepare_config()
         if config is None:
             return
+        problem = self._selection_error(config)
+        if problem is not None:
+            messagebox.showerror("Checkpoint mismatch", problem)
+            logger.warning("Collection blocked: %s", problem)
+            return
         if not fresh:
             try:
-                existing = load_checkpoint_doc(config["output"]["checkpoint_dir"])
-            except Exception as exc:
+                from .checkpoint import checkpoint_dir_for_config
+
+                target = checkpoint_dir_for_config(config["output"]["checkpoint_dir"], config)
+                existing = load_checkpoint_doc(target)
+            except (CheckpointError, OSError) as exc:
                 messagebox.showerror("Checkpoint error", str(exc))
                 return
             if existing is not None:
+                from .checkpoint import collection_name_for_config
+
+                cname = collection_name_for_config(config)
                 messagebox.showinfo(
                     "Checkpoint exists",
-                    "A checkpoint already exists. Use Resume Collection to continue it, "
-                    "or New Collection to discard it and start over.",
+                    f"Checkpoint {cname!r} already exists. Use Resume Collection to "
+                    f"continue it, or New Collection to reset only this collection "
+                    f"and start over. Other collections are untouched.",
                 )
                 return
-        self._launch_worker(config, fresh=fresh, resume=False)
+        self._launch_worker(config, fresh=fresh, resume=False,
+                            checkpoint=self._selected_checkpoint_name())
 
     def new_collection(self) -> None:
         config = self._prepare_config()
         if config is None:
             return
+        problem = self._selection_error(config)
+        if problem is not None:
+            messagebox.showerror("Checkpoint mismatch", problem)
+            logger.warning("Collection blocked: %s", problem)
+            return
         try:
-            has_checkpoint = load_checkpoint_doc(config["output"]["checkpoint_dir"]) is not None
-        except Exception:
+            from .checkpoint import checkpoint_dir_for_config, collection_name_for_config
+
+            cname = collection_name_for_config(config)
+            target = checkpoint_dir_for_config(config["output"]["checkpoint_dir"], config)
+            has_checkpoint = load_checkpoint_doc(target) is not None
+        except (CheckpointError, OSError):
             has_checkpoint = False
+            cname = "this collection"
         if has_checkpoint and not messagebox.askyesno(
-            "Discard checkpoint?",
-            "This deletes the saved checkpoint and starts a completely new collection. "
-            "Already-collected data files are kept. Continue?",
+            "Reset checkpoint?",
+            f"This resets checkpoint {cname!r} and starts a completely new collection. "
+            f"Other collections are kept, and already-collected data files are kept. Continue?",
         ):
             return
-        self._launch_worker(config, fresh=True, resume=False)
+        self._launch_worker(config, fresh=True, resume=False,
+                            checkpoint=self._selected_checkpoint_name())
 
     def resume_collection(self) -> None:
         config = self._prepare_config()
         if config is None:
             return
-        self._launch_worker(config, fresh=False, resume=True)
+        problem = self._selection_error(config)
+        if problem is not None:
+            messagebox.showerror("Checkpoint mismatch", problem)
+            logger.warning("Resume blocked: %s", problem)
+            return
+        self._launch_worker(config, fresh=False, resume=True,
+                            checkpoint=self._selected_checkpoint_name())
 
     def stop_collection(self) -> None:
         self.stop_event.set()
@@ -504,7 +792,8 @@ class CollectorApp:
         logging.getLogger().addHandler(handler)
         self._handler_attached = True
 
-    def _launch_worker(self, config: dict[str, Any], fresh: bool, resume: bool) -> None:
+    def _launch_worker(self, config: dict[str, Any], fresh: bool, resume: bool,
+                       checkpoint: str | None = None) -> None:
         setup_logging(level="INFO", log_file=config["logging"]["file"])
         self._attach_log_handler()
         target = config.get("max_posts")
@@ -531,6 +820,7 @@ class CollectorApp:
                     config, fresh=fresh and not resume, resume=resume,
                     with_comments=with_comments,
                     should_stop=self.stop_event.is_set,
+                    checkpoint=checkpoint,
                 )
                 self.result_queue.put({"ok": True, "summary": result, "config": config})
             except (CollectorError, ArcticShiftError, StorageError, Exception) as exc:
@@ -603,7 +893,7 @@ class CollectorApp:
             self.status_var.set("Failed — see log panel.")
             messagebox.showerror("Collection failed", result["error"])
             self._set_running(False)
-            self.refresh_resume_state()
+            self.refresh_checkpoint_list()
             return
         summary = result["summary"]["post"]
         comments = result["summary"]["comments"]
@@ -631,7 +921,7 @@ class CollectorApp:
                            config["output"]["processed_dir"], comments=comments),
         )
         self._set_running(False)
-        self.refresh_resume_state()
+        self.refresh_checkpoint_list()
 
     def _on_close(self) -> None:
         if self.worker is not None and self.worker.is_alive():

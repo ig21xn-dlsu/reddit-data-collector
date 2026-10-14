@@ -179,7 +179,8 @@ class TestRunCollectionFlow(unittest.TestCase):
             real_collect_new = collector_module.collect_new
             real_collect_comments = collector_module.collect_comments
 
-            def fake_collect_new(cfg, fresh=False, client=None, should_stop=None):
+            def fake_collect_new(cfg, fresh=False, client=None, should_stop=None,
+                                   checkpoint=None):
                 return real_collect_new(cfg, fresh=fresh, client=post_client,
                                         should_stop=should_stop)
 
@@ -193,7 +194,7 @@ class TestRunCollectionFlow(unittest.TestCase):
 
             def fake_collect_comments(cfg, run_id=None, max_comment_posts=None,
                                       skip_empty_posts=None, client=None,
-                                      should_stop=None):
+                                      should_stop=None, checkpoint=None):
                 return real_collect_comments(cfg, run_id=run_id, client=tree_client,
                                              should_stop=should_stop)
 
@@ -224,7 +225,8 @@ class TestRunCollectionFlow(unittest.TestCase):
             from reddit_collector import collector as collector_module
             real_collect_new = collector_module.collect_new
 
-            def fake_collect_new(cfg, fresh=False, client=None, should_stop=None):
+            def fake_collect_new(cfg, fresh=False, client=None, should_stop=None,
+                                   checkpoint=None):
                 return real_collect_new(cfg, fresh=fresh, client=post_client,
                                         should_stop=should_stop)
 
@@ -250,7 +252,8 @@ class TestRunCollectionFlow(unittest.TestCase):
             from reddit_collector import collector as collector_module
             real_collect_new = collector_module.collect_new
 
-            def fake_collect_new(cfg, fresh=False, client=None, should_stop=None):
+            def fake_collect_new(cfg, fresh=False, client=None, should_stop=None,
+                                   checkpoint=None):
                 return real_collect_new(cfg, fresh=fresh, client=post_client,
                                         should_stop=should_stop)
 
